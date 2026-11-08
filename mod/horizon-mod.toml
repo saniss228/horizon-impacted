@@ -1,0 +1,9 @@
+id = "impact_horizon_native"
+name = "Impact Horizon Native (independent)"
+version = "1.0.0"
+description = "Independent Impact-style in-game interface for the modified Horizon Native client. Not the Java Impact client."
+authors = ["Independent community prototype"]
+api = "0.1"
+side = "client"
+capabilities = ["game-read", "hud", "chat", "storage", "ui", "input", "render"]
+experimental = ["ui", "input", "render"]

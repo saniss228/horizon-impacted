@@ -1,0 +1,13 @@
+[package]
+name = "impact-horizon-native"
+version = "1.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+horizon-mod-sdk = { path = "vendor/horizon-mod-sdk" }
+
+[workspace]

@@ -1,0 +1,10 @@
+[package]
+name = "horizon-mod-sdk"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+description = "Pinned Horizon v0.2.92 mod SDK"
+
+[dependencies]
+wit-bindgen = { version = "=0.60.0", default-features = false, features = ["macros", "realloc"] }

@@ -1,0 +1,17 @@
+Independent Impact-style Horizon Native v1.0.0.
+
+Horizon SDK and WIT v0.2.92: Copyright (c) 2026 Ludovic Marie and the Horizon
+contributors; MIT, see HORIZON-SDK-MIT.txt.
+
+wit-bindgen 0.60.0 (Bytecode Alliance and contributors): distributed under a
+choice of MIT, Apache-2.0, or Apache-2.0 WITH LLVM-exception; this distribution
+provides the MIT option in WIT-BINDGEN-MIT.txt. Its build-time dependencies are
+identified in Cargo.lock in the source archive.
+
+Rust standard library (The Rust Project Contributors): MIT/Apache-2.0, see
+RUST-MIT.txt and the installed toolchain's complete RUST-STANDARD-LIBRARY-
+NOTICES.html, which includes notices for additional third-party components.
+
+Impact, Horizon, Minecraft and OptiFine are names of their respective owners.
+This independent prototype contains no Impact JAR or OptiFine files and is not
+affiliated with their developers.

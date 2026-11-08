@@ -1,0 +1,4644 @@
+diff --git a/crates/horizon-client/examples/chunk_load_bench.rs b/crates/horizon-client/examples/chunk_load_bench.rs
+index c3ee683..51693fe 100644
+--- a/crates/horizon-client/examples/chunk_load_bench.rs
++++ b/crates/horizon-client/examples/chunk_load_bench.rs
+@@ -138,6 +138,9 @@ fn main() -> Result<(), Error> {
+             blend_radius: 2,
+             smooth_lighting: true,
+             cutout_leaves: true,
++            xray: false,
++            xray_mask: horizon_client::mesher::XRAY_ALL,
++            xray_states: std::sync::Arc::new(Vec::new()),
+             assets: &context.assets,
+             render: &context.render,
+             tables: &context.tables,
+diff --git a/crates/horizon-client/examples/probe/section_mesh_fixture.rs b/crates/horizon-client/examples/probe/section_mesh_fixture.rs
+index 89624b7..b66891f 100644
+--- a/crates/horizon-client/examples/probe/section_mesh_fixture.rs
++++ b/crates/horizon-client/examples/probe/section_mesh_fixture.rs
+@@ -136,6 +136,9 @@ fn scene(
+         blend_radius,
+         smooth_lighting,
+         cutout_leaves,
++        xray: false,
++            xray_mask: horizon_client::mesher::XRAY_ALL,
++            xray_states: std::sync::Arc::new(Vec::new()),
+     };
+     let section_y = int(&row["section_y"])?;
+     let started = Instant::now();
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+index c97af3a..58352e9 100644
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -73,6 +73,14 @@ mod glowing;
+ mod golems;
+ mod growth;
+ mod hand;
++#[cfg(feature = "mods")]
++mod impact_native;
++#[cfg(feature = "mods")]
++mod impact_native_bridge;
++#[cfg(feature = "mods")]
++mod impact_native_math;
++#[cfg(feature = "mods")]
++mod impact_native_nav;
+ mod initial_spawn;
+ mod integrated;
+ mod item_draw;
+@@ -1817,6 +1825,9 @@ struct Game<'a> {
+     flight: Option<control::Flight>,
+     /// The running agent action from the control socket (game/agent.rs).
+     agent: agent::Agent,
++    /// Independent, process-local Impact-style modules.
++    #[cfg(feature = "mods")]
++    impact_native: Option<impact_native::NativeImpact>,
+     /// Widget commands waiting for the frame after a click (game/ui_control.rs).
+     ui_wait: ui_control::UiWait,
+     /// What happened, for `events` and `wait-for` (game/events.rs).
+@@ -8123,6 +8134,7 @@ impl Game<'_> {
+             }
+         }
+         // Experience orbs (ExperienceOrbRenderer): pulsing billboards from a 4x4 icon sheet.
++        let impact_orbs_start = out.len();
+         self.mark_entity(out.len(), "minecraft:experience_orb");
+         if let Some(r) = self
+             .gui
+@@ -8188,7 +8200,11 @@ impl Game<'_> {
+                 }
+             }
+         }
++        if self.impact_entity_glow() {
++            self.mark_outline(&out[impact_orbs_start..], 0x55_FF88);
++        }
+         // Falling blocks use their baked model, including non-cubic shapes.
++        let impact_falling_start = out.len();
+         self.mark_entity(out.len(), "minecraft:falling_block");
+         for f in &self.falling {
+             let Some((_, tint)) = self.block_face_sprite(f.state) else {
+@@ -8220,10 +8236,17 @@ impl Game<'_> {
+                 vertex.color = horizon_client::hud_layout::multiply(vertex.color, tint);
+             }
+         }
++        if self.impact_entity_glow() {
++            self.mark_outline(&out[impact_falling_start..], 0x55_FF88);
++        }
+         self.mark_entity(out.len(), "");
+         self.moving_piston_geometry(camera, alpha, &mut out);
+         self.mark_entity(out.len(), "minecraft:tnt");
++        let impact_entity_start = out.len();
+         self.tnt_geometry(camera, alpha, &mut out);
++        if self.impact_entity_glow() {
++            self.mark_outline(&out[impact_entity_start..], 0x55_FF88);
++        }
+         self.mark_entity(out.len(), "minecraft:painting");
+         self.painting_geometry(camera, &mut out);
+         self.mark_entity(out.len(), "minecraft:item_frame");
+@@ -8239,15 +8262,31 @@ impl Game<'_> {
+         self.mark_stage(out.len(), "NONE");
+         self.beacon_geometry(camera, alpha, &mut out);
+         self.mark_entity(out.len(), "minecraft:fishing_bobber");
++        let impact_entity_start = out.len();
+         self.fishing_geometry(camera, alpha, &mut out);
++        if self.impact_entity_glow() {
++            self.mark_outline(&out[impact_entity_start..], 0x55_FF88);
++        }
+         self.mark_entity(out.len(), "minecraft:leash_knot");
+         self.leash_geometry(camera, alpha, &mut out);
+         self.mark_entity(out.len(), "minecraft:trident");
++        let impact_entity_start = out.len();
+         self.trident_geometry(camera, alpha, &mut out);
++        if self.impact_entity_glow() {
++            self.mark_outline(&out[impact_entity_start..], 0x55_FF88);
++        }
+         self.mark_entity(out.len(), "minecraft:firework_rocket");
++        let impact_entity_start = out.len();
+         self.rocket_geometry(camera, alpha, &mut out);
++        if self.impact_entity_glow() {
++            self.mark_outline(&out[impact_entity_start..], 0x55_FF88);
++        }
+         self.mark_entity(out.len(), "minecraft:splash_potion");
++        let impact_entity_start = out.len();
+         self.thrown_potion_geometry(camera, alpha, &mut out);
++        if self.impact_entity_glow() {
++            self.mark_outline(&out[impact_entity_start..], 0x55_FF88);
++        }
+         // Particles (ParticleEngine.extract): camera-facing quads.
+         self.mark_stage(out.len(), "PARTICLES");
+         let world = &self.world;
+@@ -8572,6 +8611,8 @@ impl Game<'_> {
+     }
+     /// Player.attack with the attack-strength charge, crits and knockback.
+     fn attack(&mut self) -> bool {
++        #[cfg(feature = "mods")]
++        if self.lan_acting.is_none() && self.impact_protect_attack() { return false; }
+         if self.spectator() {
+             return false;
+         }
+@@ -11616,6 +11657,12 @@ impl Game<'_> {
+             lines.extend(g.lines);
+             on_top = g.on_top;
+         }
++        #[cfg(feature = "mods")]
++        if let Some(native) = self.impact_native.as_ref() {
++            let visual = native.world_visuals(self, camera.to_array(), view_yaw, view_pitch);
++            lines.extend(visual.lines);
++            on_top.extend(visual.on_top);
++        }
+         let view = horizon_client::camera::view_matrix(view_yaw, view_pitch);
+         let at = camera.to_array();
+         // GameRenderer.render3dHud: the debug crosshair, first person with the HUD shown.
+@@ -12219,6 +12266,8 @@ impl Game<'_> {
+     }
+     /// A mouse button while playing (window or control socket).
+     fn play_mouse(&mut self, button: MouseButton, pressed: bool) -> Result<()> {
++        #[cfg(feature = "mods")]
++        if self.impact_native_mouse(button, pressed) { return Ok(()); }
+         // A mod's claimed item takes the use button (capability `input`).
+         if self.mod_use(button, pressed) {
+             return Ok(());
+@@ -12333,6 +12382,7 @@ impl Game<'_> {
+     }
+     fn prepare_lod(&mut self) {
+         let enabled = self.far_terrain_choice().0 > 0
++            && !self.streaming.xray
+             && self.renderer.is_some()
+             && self.player.is_some()
+             && self.title.is_none()
+@@ -13912,6 +13962,8 @@ impl<'a> Game<'a> {
+             ui_wait: Default::default(),
+             events: Default::default(),
+             agent: agent::Agent::default(),
++            #[cfg(feature = "mods")]
++            impact_native: Some(impact_native::NativeImpact::default()),
+             view_frustum: None,
+             entity_culler: None,
+             pack_shadow_casters: (false, false),
+diff --git a/crates/horizon-client/src/game/agent.rs b/crates/horizon-client/src/game/agent.rs
+index 4ab0a51..634ea86 100644
+--- a/crates/horizon-client/src/game/agent.rs
++++ b/crates/horizon-client/src/game/agent.rs
+@@ -253,6 +253,7 @@ struct Goto {
+     target: [f64; 3],
+     near: f64,
+     sprint: bool,
++    strict_y: bool,
+     path: Vec<Node>,
+     next: usize,
+     /// Tick of the last waypoint reached, and how many replans so far.
+@@ -765,12 +766,22 @@ impl Game<'_> {
+     fn walkable(&self, n: Node) -> bool {
+         let below = self.world.block(n[0], n[1] - 1, n[2]);
+         let lava = |p: [i32; 3]| {
+-            &*self
+-                .res
+-                .facts()
+-                .get(self.world.block(p[0], p[1], p[2]))
+-                .name
+-                == "minecraft:lava"
++            let f = self.res.facts().get(self.world.block(p[0], p[1], p[2]));
++            let name = f.name.strip_prefix("minecraft:").unwrap_or(&f.name);
++            f.fluid != horizon_client::blocks::Fluid::None
++                || matches!(
++                    name,
++                    "lava"
++                        | "water"
++                        | "fire"
++                        | "soul_fire"
++                        | "magma_block"
++                        | "cactus"
++                        | "campfire"
++                        | "soul_campfire"
++                        | "powder_snow"
++                        | "sweet_berry_bush"
++                )
+         };
+         self.world.chunks.contains_key(&(n[0] >> 4, n[2] >> 4))
+             && (self.blocks_motion([n[0], n[1] - 1, n[2]])
+@@ -778,10 +789,22 @@ impl Game<'_> {
+             && !self.blocks_motion(n)
+             && !self.blocks_motion([n[0], n[1] + 1, n[2]])
+             && !lava(n)
++            && !lava([n[0], n[1] + 1, n[2]])
+             && !lava([n[0], n[1] - 1, n[2]])
++            && [[1, 0], [-1, 0], [0, 1], [0, -1]].iter().all(|[dx, dz]| {
++                let (x, z) = (n[0] + dx, n[2] + dz);
++                self.world.chunks.contains_key(&(x >> 4, z >> 4))
++                    && (-1..=1).all(|dy| !lava([x, n[1] + dy, z]))
++            })
+     }
+     /// A* over standable feet positions: steps up one block, drops up to three.
+-    fn find_path(&self, from: Node, goal: [f64; 3], near: f64) -> Option<Vec<Node>> {
++    pub(super) fn find_path(
++        &self,
++        from: Node,
++        goal: [f64; 3],
++        near: f64,
++        strict_y: bool,
++    ) -> Option<Vec<Node>> {
+         use std::{cmp::Reverse, collections::BinaryHeap};
+         let reached = |n: Node| {
+             let c = [
+@@ -790,7 +813,7 @@ impl Game<'_> {
+                 f64::from(n[2]) + 0.5,
+             ];
+             ((c[0] - goal[0]).powi(2) + (c[2] - goal[2]).powi(2)).sqrt() <= near.max(0.5)
+-                && (c[1] - goal[1]).abs() <= near.max(1.0) + 0.5
++                && (c[1] - goal[1]).abs() <= if strict_y { 0.8 } else { near.max(1.0) + 0.5 }
+         };
+         let h = |n: Node| {
+             ((f64::from(n[0]) + 0.5 - goal[0]).abs()
+@@ -877,7 +900,9 @@ impl Game<'_> {
+             dist(eye, point(a)).total_cmp(&dist(eye, point(b)))
+         });
+         for f in faces {
+-            for inset in [0.45, 0.3, 0.0] {
++            // A sample very close to the face permits a crouched player to
++            // place against an edge without walking to the dangerous limit.
++            for inset in [0.4999, 0.49, 0.45, 0.3, 0.0] {
+                 let point = [0, 1, 2].map(|i| centre[i] + f64::from(f[i]) * inset);
+                 let (yaw, pitch) = yaw_pitch(eye, point);
+                 let dir = super::view_vector(yaw, pitch);
+@@ -1186,7 +1211,7 @@ impl Game<'_> {
+                 let timeout = a.num("timeout", 60.0)?;
+                 let p = self.player.as_ref().ok_or("no player")?.position;
+                 let from = [p.x.floor() as i32, p.y.round() as i32, p.z.floor() as i32];
+-                let (path, warning) = match self.find_path(from, target, near) {
++                let (path, warning) = match self.find_path(from, target, near, a.has("strict-y")) {
+                     Some(path) => (path, None),
+                     None if a.has("direct") => (
+                         Vec::new(),
+@@ -1203,6 +1228,7 @@ impl Game<'_> {
+                     target,
+                     near,
+                     sprint: a.has("sprint"),
++                    strict_y: a.has("strict-y"),
+                     path,
+                     next: 1,
+                     progress_tick: self.ticks,
+@@ -1979,7 +2005,12 @@ impl Game<'_> {
+         let horizontal =
+             |a: [f64; 3], b: [f64; 3]| ((a[0] - b[0]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+         let arrived = horizontal(p, g.target) <= g.near
+-            && (p[1] - g.target[1]).abs() <= g.near.max(1.0) + 1.0;
++            && (p[1] - g.target[1]).abs()
++                <= if g.strict_y {
++                    0.8
++                } else {
++                    g.near.max(1.0) + 1.0
++                };
+         if arrived {
+             return Some(
+                 json!({ "ok": true, "arrived": true, "position": p, "target": g.target,
+@@ -1996,6 +2027,9 @@ impl Game<'_> {
+         let mut aim = g.target;
+         while g.next < g.path.len() {
+             let n = g.path[g.next];
++            if !self.walkable(n) {
++                return Some(json!({"error":"path became unsafe or unloaded", "position":p}));
++            }
+             let c = [
+                 f64::from(n[0]) + 0.5,
+                 f64::from(n[1]),
+@@ -2028,7 +2062,7 @@ impl Game<'_> {
+                 p[1].round() as i32,
+                 p[2].floor() as i32,
+             ];
+-            if let Some(path) = self.find_path(from, g.target, g.near) {
++            if let Some(path) = self.find_path(from, g.target, g.near, g.strict_y) {
+                 g.path = path;
+                 g.next = 1;
+             }
+diff --git a/crates/horizon-client/src/game/agent_settings.rs b/crates/horizon-client/src/game/agent_settings.rs
+index 5045f1c..dd20ef6 100644
+--- a/crates/horizon-client/src/game/agent_settings.rs
++++ b/crates/horizon-client/src/game/agent_settings.rs
+@@ -19,6 +19,14 @@ impl Game<'_> {
+     /// At startup: open the socket if the game was started for an agent or Agent Control is on.
+     pub(super) fn start_agent_control(&mut self) -> Result<()> {
+         self.agent_control_on = self.settings.extras.agent_control;
++        // The Native launcher disables the socket for this session only. An
++        // explicitly instrumented test may omit this environment variable.
++        if std::env::var_os("IMPACT_NATIVE_DISABLE_CONTROL").as_deref()
++            == Some(std::ffi::OsStr::new("1"))
++        {
++            log::info!("Impact Native: Agent Control disabled for this session");
++            return Ok(());
++        }
+         if self.options.benchmark.is_some() && self.options.control.is_none() {
+             return Ok(());
+         }
+@@ -60,6 +68,13 @@ impl Game<'_> {
+     /// closes it.
+     pub(super) fn sync_agent_control(&mut self) {
+         let wanted = self.settings.extras.agent_control;
++        if std::env::var_os("IMPACT_NATIVE_DISABLE_CONTROL").as_deref()
++            == Some(std::ffi::OsStr::new("1"))
++        {
++            self.control = None;
++            self.agent_control_on = wanted;
++            return;
++        }
+         let changed = wanted != self.agent_control_on;
+         self.agent_control_on = wanted;
+         let open = self
+diff --git a/crates/horizon-client/src/game/control.rs b/crates/horizon-client/src/game/control.rs
+index 0fe5d89..fb57e9f 100644
+--- a/crates/horizon-client/src/game/control.rs
++++ b/crates/horizon-client/src/game/control.rs
+@@ -117,6 +117,8 @@ impl Game<'_> {
+         }
+         horizon_client::widgets::end_frame(self.frames);
+         self.advance_agent();
++        #[cfg(feature = "mods")]
++        self.impact_native_frame(event_loop);
+         for request in self.ui_wait.ready() {
+             self.answer(request, event_loop);
+         }
+@@ -1096,6 +1098,11 @@ impl Game<'_> {
+         status["border"] = json!({ "center": self.border.center(), "size": self.border.size() });
+         // The scoreboard sidebar the HUD shows.
+         status["sidebar"] = self.sidebar_status();
++        #[cfg(feature = "mods")]
++        if let Some(native) = self.impact_native.as_ref() {
++            status["impact_native"] = native.test_status(self);
++        }
++
+         status
+     }
+ }
+diff --git a/crates/horizon-client/src/game/creatures.rs b/crates/horizon-client/src/game/creatures.rs
+index f7d4828..50b2778 100644
+--- a/crates/horizon-client/src/game/creatures.rs
++++ b/crates/horizon-client/src/game/creatures.rs
+@@ -4369,7 +4369,7 @@ impl Game<'_> {
+             if let Some((start, rgb)) = glowing.take() {
+                 self.mark_outline(&out[start..], rgb);
+             }
+-            if a.id != 0 && self.entity_glowing(a.id) {
++            if a.id != 0 && (self.entity_glowing(a.id) || self.impact_entity_glow()) {
+                 glowing = Some((out.len(), super::glowing::team_color(self.mob_team(a.id))));
+             }
+             let p = glam::DVec3::from_array(at) - camera;
+diff --git a/crates/horizon-client/src/game/entity_culling.rs b/crates/horizon-client/src/game/entity_culling.rs
+index 971639a..3fedfec 100644
+--- a/crates/horizon-client/src/game/entity_culling.rs
++++ b/crates/horizon-client/src/game/entity_culling.rs
+@@ -33,6 +33,12 @@ impl Game<'_> {
+     /// Use complete generated geometry so equipment, animation and custom
+     /// models cannot stick out of an assumed collision-sized culling box.
+     pub(super) fn cull_entity_vertices(&self, vertices: &mut Vec<Vertex>, start: usize) {
++        // Capture silhouettes before normal terrain culling. This also covers
++        // boats, minecarts, armor stands, paintings and item frames without
++        // modifying their server-side glowing state.
++        if self.impact_entity_glow() {
++            self.mark_outline(&vertices[start..], 0x55_FF88);
++        }
+         let Some(culler) = &self.entity_culler else {
+             return;
+         };
+diff --git a/crates/horizon-client/src/game/glowing.rs b/crates/horizon-client/src/game/glowing.rs
+index 8c78dbd..18582cf 100644
+--- a/crates/horizon-client/src/game/glowing.rs
++++ b/crates/horizon-client/src/game/glowing.rs
+@@ -12,6 +12,19 @@ pub(super) fn team_color(team: Option<&sb::Team>) -> u32 {
+ }
+ 
+ impl Game<'_> {
++    /// Client-local visual override. Never propagate it to the LAN/server.
++    pub(super) fn impact_entity_glow(&self) -> bool {
++        #[cfg(feature = "mods")]
++        {
++            self.impact_native
++                .as_ref()
++                .is_some_and(|n| n.entity_glow_enabled())
++        }
++        #[cfg(not(feature = "mods"))]
++        {
++            false
++        }
++    }
+     /// `Entity.isCurrentlyGlowing` of an entity that is not living (an item, a projectile):
+     /// its `Glowing` tag, or shared flag 6 as a server sent it.
+     pub(super) fn entity_glowing(&self, id: u32) -> bool {
+@@ -25,6 +38,18 @@ impl Game<'_> {
+     /// `Minecraft.shouldEntityAppearGlowing` of a mob or another player, with its outline
+     /// colour (`getTeamColor`; another player's team goes by name).
+     pub(super) fn mob_outline(&self, m: &Mob) -> Option<u32> {
++        #[cfg(feature = "mods")]
++        if self
++            .impact_native
++            .as_ref()
++            .is_some_and(|n| n.entity_glow_enabled())
++        {
++            return Some(if &*m.kind.id == "minecraft:player" {
++                0x55_AAFF
++            } else {
++                0x55_FF88
++            });
++        }
+         if !m.is_currently_glowing() {
+             return None;
+         }
+diff --git a/crates/horizon-client/src/game/impact_native.rs b/crates/horizon-client/src/game/impact_native.rs
+new file mode 100644
+index 0000000..6b8066d
+--- /dev/null
++++ b/crates/horizon-client/src/game/impact_native.rs
+@@ -0,0 +1,2888 @@
++//! Independent Impact-style utilities. This does not load the Java client.
++//! The bundled UI exchanges bounded messages with this module only in memory;
++//! no panel, child process or Agent Control socket is involved.
++use super::{
++    Game, Screen,
++    agent::Handled,
++    impact_native_bridge as bridge,
++    impact_native_math::{self as math, Intercept},
++    impact_native_nav::{self as nav, Cell, Step},
++};
++use horizon_client::text::Text;
++use horizon_client::{
++    chunk::{MIN_Y, SECTIONS},
++    gizmos::{Gizmos, Line},
++};
++use horizon_core::geometry::Vec3;
++use horizon_world::registry::BlockStateId;
++use std::{
++    collections::HashMap,
++    sync::Arc,
++    sync::mpsc::{self, Receiver, TryRecvError},
++    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
++};
++use winit::{event::MouseButton, event_loop::ActiveEventLoop, keyboard::KeyCode};
++
++const SCAN_SECONDS: u64 = 4;
++const UPDATE_MILLIS: u64 = 500;
++const MAX_NAV_DISTANCE: f64 = 2048.0;
++const NAV_SEGMENT: f64 = 24.0;
++const MAX_ORE_RESULTS: usize = 128;
++const SCAN_BUDGET_MICROS: u128 = 1200;
++const SCAN_SECTIONS_PER_CALL: usize = 8;
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum TaskKind {
++    Walk,
++    Navigate,
++    NavEdit,
++    Mine,
++}
++struct Pending {
++    kind: TaskKind,
++    rx: Receiver<String>,
++}
++
++/// Sneak continuously while moving onto the safe overhang of an existing
++/// full block. No separate process or socket controls this operation.
++struct NavEdge {
++    target: [i32; 3],
++    support: [i32; 3],
++    dx: i32,
++    dz: i32,
++    item: String,
++    rising: bool,
++    started: Instant,
++    settled: Option<Instant>,
++}
++
++/// Only coordinates are kept; chunks can unload between slices of the scan.
++struct OreScan {
++    eye: [f64; 3],
++    dimension: String,
++    radius: i32,
++    sections: Vec<(i32, usize, i32)>,
++    cursor: usize,
++    found: Vec<([i32; 3], f64)>,
++}
++
++struct PlayerView<'a> {
++    mob: &'a horizon_client::mobs::Mob,
++    uuid: u128,
++    name: String,
++}
++struct BridgeBuild {
++    route: Vec<[i32; 3]>,
++    next: usize,
++    waiting: bool,
++}
++/// A slow, owned sneak towards the centre of one solid support block.
++struct BridgeCenter {
++    support: [i32; 3],
++    started: Instant,
++}
++
++struct CritPending {
++    target: u32,
++    manual: bool,
++    started: Instant,
++    initial_yaw: f32,
++    initial_pitch: f32,
++}
++
++pub(super) struct NativeImpact {
++    session: String,
++    mod_generation: Option<u64>,
++    heartbeat: u64,
++    last_bridge_seq: u64,
++    last_native_seq: u64,
++    last_update: Option<Instant>,
++    last_scan: Option<Instant>,
++    last_action: Option<Instant>,
++    ore: bool,
++    radar: bool,
++    attack: bool,
++    walk: bool,
++    aim: bool,
++    bow: bool,
++    mine: bool,
++    player_attack: bool,
++    player_bow: bool,
++    crits: bool,
++    crit_pending: Option<CritPending>,
++    crit_jump_owned: bool,
++    swallow_left_release: bool,
++    swallow_right_release: bool,
++    friends_loaded: bool,
++    friends: HashMap<u128, String>,
++    friends_selecting: bool,
++    bridge_selecting: bool,
++    bridge_first: Option<[i32; 3]>,
++    bridge_build: Option<BridgeBuild>,
++    bridge_centering: Option<BridgeCenter>,
++    attack_range: f64,
++    attack_delay: f64,
++    aim_radius: f64,
++    all_mobs: bool,
++    ore_type: String,
++    ore_radius: i32,
++    nearest_ore: Option<[i32; 3]>,
++    ore_results: Vec<[i32; 3]>,
++    scan: Option<OreScan>,
++    scan_anchor: Option<([f64; 3], String)>,
++    visual_arc: bool,
++    visual_ore: bool,
++    visual_mob: bool,
++    visual_glow: bool,
++    visual_xray: bool,
++    visual_tracers: bool,
++    xray_mask: u32,
++    xray_rules: Vec<(String, bool)>,
++    aim_walls: bool,
++    last_lead: Option<Intercept>,
++    queued_nav: Option<[f64; 3]>,
++    nav_started: bool,
++    nav_edge: Option<NavEdge>,
++    nav_retreat: Option<([i32; 3], i32, i32)>,
++    // Between planned steps wait briefly for a controlled jump or drop to land.
++    nav_airborne_since: Option<Instant>,
++    pending: Option<Pending>,
++    last_focus: bool,
++}
++impl Default for NativeImpact {
++    fn default() -> Self {
++        let now = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .unwrap_or_default()
++            .as_nanos();
++        Self {
++            // This is a run identifier, not an authentication token.
++            session: format!("{:032x}", now ^ ((std::process::id() as u128) << 64)),
++            mod_generation: None,
++            heartbeat: 0,
++            last_bridge_seq: 0,
++            last_native_seq: 0,
++            last_update: None,
++            last_scan: None,
++            last_action: None,
++            ore: false,
++            radar: false,
++            attack: false,
++            walk: false,
++            aim: false,
++            bow: false,
++            mine: false,
++            player_attack: false,
++            player_bow: false,
++            crits: false,
++            crit_pending: None,
++            crit_jump_owned: false,
++            swallow_left_release: false,
++            swallow_right_release: false,
++            friends_loaded: false,
++            friends: HashMap::new(),
++            friends_selecting: false,
++            bridge_selecting: false,
++            bridge_first: None,
++            bridge_build: None,
++            bridge_centering: None,
++            attack_range: 3.0,
++            attack_delay: 0.2,
++            aim_radius: 48.0,
++            all_mobs: false,
++            ore_type: "diamond".into(),
++            ore_radius: 32,
++            nearest_ore: None,
++            ore_results: Vec::new(),
++            scan: None,
++            scan_anchor: None,
++            visual_arc: false,
++            visual_ore: false,
++            visual_mob: false,
++            visual_glow: false,
++            visual_xray: false,
++            visual_tracers: false,
++            xray_mask: horizon_client::mesher::XRAY_ALL,
++            xray_rules: Vec::new(),
++            aim_walls: false,
++            last_lead: None,
++            queued_nav: None,
++            nav_started: false,
++            nav_edge: None,
++            nav_retreat: None,
++            nav_airborne_since: None,
++            pending: None,
++            last_focus: false,
++        }
++    }
++}
++
++fn elapsed(last: Option<Instant>, duration: Duration) -> bool {
++    last.is_none_or(|v| v.elapsed() >= duration)
++}
++fn bool_word(v: bool) -> u8 {
++    u8::from(v)
++}
++fn hostile(id: &str) -> bool {
++    matches!(
++        id.strip_prefix("minecraft:").unwrap_or(id),
++        "zombie"
++            | "husk"
++            | "drowned"
++            | "zombie_villager"
++            | "skeleton"
++            | "stray"
++            | "bogged"
++            | "wither_skeleton"
++            | "creeper"
++            | "witch"
++            | "slime"
++            | "magma_cube"
++            | "blaze"
++            | "ghast"
++            | "phantom"
++            | "silverfish"
++            | "endermite"
++            | "guardian"
++            | "elder_guardian"
++            | "pillager"
++            | "vindicator"
++            | "evoker"
++            | "ravager"
++            | "vex"
++            | "breeze"
++            | "shulker"
++            | "hoglin"
++            | "zoglin"
++            | "piglin_brute"
++            | "wither"
++            | "ender_dragon"
++    )
++}
++fn ore_matches(category: &str, name: &str) -> bool {
++    let id = name.strip_prefix("minecraft:").unwrap_or(name);
++    match category {
++        "diamond" => matches!(id, "diamond_ore" | "deepslate_diamond_ore"),
++        "iron" => matches!(id, "iron_ore" | "deepslate_iron_ore"),
++        "gold" => matches!(id, "gold_ore" | "deepslate_gold_ore" | "nether_gold_ore"),
++        "redstone" => matches!(id, "redstone_ore" | "deepslate_redstone_ore"),
++        "emerald" => matches!(id, "emerald_ore" | "deepslate_emerald_ore"),
++        "coal" => matches!(id, "coal_ore" | "deepslate_coal_ore"),
++        "copper" => matches!(id, "copper_ore" | "deepslate_copper_ore"),
++        "lapis" => matches!(id, "lapis_ore" | "deepslate_lapis_ore"),
++        "quartz" => id == "nether_quartz_ore",
++        "debris" => id == "ancient_debris",
++        _ => false,
++    }
++}
++fn number(text: &str, min: f64, max: f64) -> Option<f64> {
++    let n: f64 = text.parse().ok()?;
++    (n.is_finite() && (min..=max).contains(&n)).then_some(n)
++}
++fn xray_rules(text: &str) -> Option<Vec<(String, bool)>> {
++    if text.is_empty() {
++        return Some(Vec::new());
++    }
++    let mut result = Vec::new();
++    for rule in text.split(',') {
++        let (name, value) = rule.split_once('=')?;
++        if name.is_empty()
++            || name.len() > 48
++            || !name.contains(':')
++            || !name
++                .bytes()
++                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"_.:/-".contains(&c))
++            || result.len() >= 16
++            || result.iter().any(|(n, _)| n == name)
++        {
++            return None;
++        }
++        result.push((name.to_owned(), switch(value)?));
++    }
++    result.sort_by(|a, b| a.0.cmp(&b.0));
++    Some(result)
++}
++fn switch(text: &str) -> Option<bool> {
++    match text {
++        "on" | "1" => Some(true),
++        "off" | "0" => Some(false),
++        _ => None,
++    }
++}
++impl Game<'_> {
++    fn impact_current_hit(&self) -> Option<(u32, f64)> {
++        let mob = self
++            .mob_hit()
++            .and_then(|(i, d)| self.before_block(d).then_some((self.mobs[i].id, d)));
++        let guest = self.guest_hit().and_then(|(conn, d)| {
++            let m = self.lan.as_ref()?.models.get(&conn)?;
++            self.before_block(d).then_some((m.id, d))
++        });
++        match (mob, guest) {
++            (Some(a), Some(b)) => Some(if a.1 <= b.1 { a } else { b }),
++            (Some(a), None) | (None, Some(a)) => Some(a),
++            _ => None,
++        }
++    }
++    fn impact_center(&self, id: u32) -> Option<[f64; 3]> {
++        self.mobs
++            .iter()
++            .find(|m| m.id == id && m.alive())
++            .map(|m| m.center())
++            .or_else(|| {
++                self.lan
++                    .as_ref()?
++                    .models
++                    .values()
++                    .find(|m| m.id == id && m.alive())
++                    .map(|m| m.center())
++            })
++    }
++    pub(super) fn impact_protect_attack(&self) -> bool {
++        self.impact_native
++            .as_ref()
++            .is_some_and(|n| n.friends_selecting || n.friend_risk(self))
++    }
++    pub(super) fn impact_native_mouse(&mut self, button: MouseButton, pressed: bool) -> bool {
++        let Some(mut n) = self.impact_native.take() else {
++            return false;
++        };
++        let consumed = n.mouse(self, button, pressed);
++        self.impact_native = Some(n);
++        consumed
++    }
++    pub(super) fn impact_native_frame(&mut self, event_loop: &ActiveEventLoop) {
++        if let Some(mut native) = self.impact_native.take() {
++            native.frame(self, event_loop);
++            self.impact_native = Some(native);
++        }
++    }
++}
++impl NativeImpact {
++    fn say(game: &mut Game<'_>, text: impl AsRef<str>) {
++        game.system_message(Text::literal(format!("[Impact Native] {}", text.as_ref())));
++    }
++    fn reset_active(&mut self) {
++        self.attack = false;
++        self.walk = false;
++        self.aim = false;
++        self.bow = false;
++        self.mine = false;
++        self.player_attack = false;
++        self.player_bow = false;
++        self.friends_selecting = false;
++        self.bridge_selecting = false;
++        self.bridge_first = None;
++        self.bridge_build = None;
++        self.bridge_centering = None;
++        self.queued_nav = None;
++        self.nav_started = false;
++        self.nav_edge = None;
++        self.nav_retreat = None;
++        self.nav_airborne_since = None;
++        self.last_lead = None;
++    }
++    fn drain_pending(&mut self, game: &mut Game<'_>) {
++        let result = self.pending.as_ref().map(|p| (p.kind, p.rx.try_recv()));
++        match result {
++            Some((kind, Ok(line))) => {
++                self.pending = None;
++                let error = serde_json::from_str::<serde_json::Value>(&line)
++                    .ok()
++                    .and_then(|v| v["error"].as_str().map(str::to_owned));
++                if matches!(kind, TaskKind::Navigate) {
++                    if let Some(e) = &error {
++                        self.queued_nav = None;
++                        self.nav_started = false;
++                        self.bridge_build = None;
++                        Self::say(game, format!("Navigation stopped: {e}"));
++                    } else if self
++                        .queued_nav
++                        .is_some_and(|goal| Self::arrived(game, goal))
++                    {
++                        self.queued_nav = None;
++                        self.nav_started = false;
++                        Self::say(game, "Navigation finished.");
++                    }
++                    // Otherwise retain the far goal; the next frame starts
++                    // another short path through the newly loaded chunks.
++                }
++                if matches!(kind, TaskKind::NavEdit)
++                    && let Some(error) = &error
++                {
++                    self.queued_nav = None;
++                    self.nav_started = false;
++                    self.nav_retreat = None;
++                    self.bridge_build = None;
++                    Self::say(game, format!("Navigation edit stopped: {error}"));
++                }
++                if matches!(kind, TaskKind::Mine) {
++                    // The last scan still named the block we just broke. Never
++                    // try to mine that stale position a second time: rescan
++                    // immediately before selecting the next target.
++                    self.invalidate_scan();
++                    if let Some(error) = error {
++                        self.mine = false;
++                        Self::say(game, format!("AutoMine stopped: {error}"));
++                    }
++                }
++            }
++            Some((kind, Err(TryRecvError::Disconnected))) => {
++                self.pending = None;
++                if kind == TaskKind::Navigate {
++                    self.queued_nav = None;
++                    self.nav_started = false;
++                    self.bridge_build = None;
++                    Self::say(game, "Navigation stopped: action channel closed.");
++                }
++                if kind == TaskKind::NavEdit {
++                    self.queued_nav = None;
++                    self.nav_started = false;
++                    self.bridge_build = None;
++                    self.nav_retreat = None;
++                    Self::say(game, "Navigation stopped: edit channel closed.");
++                }
++                if kind == TaskKind::Mine {
++                    self.mine = false;
++                    self.invalidate_scan();
++                }
++            }
++            _ => {}
++        }
++    }
++    fn cancel_own(&mut self, game: &mut Game<'_>, event_loop: &ActiveEventLoop) {
++        self.drain_pending(game);
++        // Do not stop a task owned by an external controller or release a
++        // player's real keys when this module has no outstanding task.
++        let had_edge = self.nav_edge.take().is_some();
++        if self.bridge_centering.take().is_some() {
++            for key in [KeyCode::KeyW, KeyCode::ShiftLeft] {
++                if !game.physical_keys.contains(&key) {
++                    game.keys.remove(&key);
++                }
++            }
++        }
++        self.nav_retreat = None;
++        self.nav_airborne_since = None;
++        self.cancel_critical(game);
++        if self.pending.take().is_some() || had_edge {
++            let (tx, _) = mpsc::channel();
++            let _ = game.agent_command(&["stop"], "stop", &tx, event_loop);
++        }
++    }
++    fn disable_active(&mut self, game: &mut Game<'_>, event_loop: &ActiveEventLoop) {
++        self.cancel_own(game, event_loop);
++        self.reset_active();
++    }
++    fn do_action(
++        &mut self,
++        game: &mut Game<'_>,
++        event_loop: &ActiveEventLoop,
++        line: String,
++        kind: TaskKind,
++    ) -> Result<(), String> {
++        if self.pending.is_some() {
++            return Err("another native action is running".into());
++        }
++        let words: Vec<_> = line.split_whitespace().collect();
++        let (tx, rx) = mpsc::channel();
++        match game
++            .agent_command(&words, &line, &tx, event_loop)
++            .map_err(|e| e.to_string())?
++        {
++            Handled::Deferred => {
++                self.pending = Some(Pending { kind, rx });
++                Ok(())
++            }
++            Handled::Reply(_) => Ok(()),
++            Handled::No => Err("internal action not available".into()),
++        }
++    }
++    fn bridge_request(&mut self, game: &mut Game<'_>, event_loop: &ActiveEventLoop) {
++        let Some(raw) = game.mods.mods.impact_native_request("bridge_request") else {
++            return;
++        };
++        let Ok(line) = std::str::from_utf8(&raw) else {
++            return;
++        };
++        let a: Vec<_> = line.trim().split('|').collect();
++        if a.len() != 5 || a[0] != "v1" || a[1] != self.session {
++            return;
++        }
++        let Ok(seq) = a[2].parse::<u64>() else { return };
++        if seq <= self.last_bridge_seq {
++            return;
++        }
++        let Some(on) = switch(a[4]) else { return };
++        self.last_bridge_seq = seq;
++        match a[3] {
++            "stop" => {
++                self.disable_active(game, event_loop);
++                self.ore = false;
++                self.radar = false;
++            }
++            "ore" => {
++                self.ore = on;
++                if !on {
++                    self.mine = false;
++                }
++                self.invalidate_scan();
++            }
++            "radar" => self.radar = on,
++            "attack" => {
++                self.disable_active(game, event_loop);
++                self.attack = on;
++            }
++            "walk" => {
++                self.disable_active(game, event_loop);
++                self.walk = on;
++            }
++            _ => {}
++        }
++        self.last_update = None;
++    }
++    fn native_request(&mut self, game: &mut Game<'_>, event_loop: &ActiveEventLoop) {
++        let Some(raw) = game.mods.mods.impact_native_request("native_request") else {
++            return;
++        };
++        let Ok(line) = std::str::from_utf8(&raw) else {
++            return;
++        };
++        let a: Vec<_> = line.trim().split('|').collect();
++        if a.len() < 4 || a.len() > 7 || a[0] != "v1" || a[1] != self.session {
++            return;
++        }
++        let Ok(seq) = a[2].parse::<u64>() else { return };
++        if seq <= self.last_native_seq {
++            return;
++        }
++        self.last_native_seq = seq;
++        match a.as_slice() {
++            [_, _, _, "goto", x, y, z] => {
++                let target = number(x, -30_000_000.0, 30_000_000.0)
++                    .zip(number(y, -64.0, 320.0))
++                    .zip(number(z, -30_000_000.0, 30_000_000.0))
++                    .map(|((x, y), z)| [x, y, z]);
++                let valid = target.zip(game.player.as_ref()).is_some_and(|(t, p)| {
++                    let dx = t[0] - p.position.x;
++                    let dy = t[1] - p.position.y;
++                    let dz = t[2] - p.position.z;
++                    (dx * dx + dy * dy + dz * dz).sqrt() <= MAX_NAV_DISTANCE
++                });
++                if valid {
++                    self.disable_active(game, event_loop);
++                    self.queued_nav = target;
++                    Self::say(
++                        game,
++                        "Navigation queued; close the chat/menu. STOP cancels it.",
++                    );
++                } else {
++                    Self::say(game, "Invalid target or more than 2048 blocks away.");
++                }
++            }
++            [_, _, _, "range", value] => {
++                if let Some(x) = number(value, 1.0, 6.0) {
++                    self.attack_range = x;
++                    Self::say(
++                        game,
++                        format!("Attack radius: {x:.1} blocks (server reach still applies)."),
++                    );
++                } else {
++                    Self::say(
++                        game,
++                        "Attack radius must be 1.0 to 6.0; actual reach still applies.",
++                    );
++                }
++            }
++            [_, _, _, "delay", value] => {
++                if let Some(x) = number(value, 0.1, 5.0) {
++                    self.attack_delay = x;
++                    Self::say(game, format!("Attack interval: {x:.1} seconds."));
++                } else {
++                    Self::say(game, "Attack interval must be 0.1 to 5 seconds.");
++                }
++            }
++            [_, _, _, "aimradius", value] => {
++                if let Some(x) = number(value, 4.0, 128.0) {
++                    self.aim_radius = x;
++                    Self::say(
++                        game,
++                        format!("Aim search radius: {x:.0} blocks (loaded mobs only)."),
++                    );
++                } else {
++                    Self::say(game, "Aim radius must be 4 to 128.");
++                }
++            }
++            [_, _, _, "targets", value] => match *value {
++                "hostile" => {
++                    self.all_mobs = false;
++                    Self::say(game, "Targeting hostile mobs only.");
++                }
++                "all" => {
++                    self.all_mobs = true;
++                    Self::say(
++                        game,
++                        "Targeting all mobs, including passive mobs; players excluded.",
++                    );
++                }
++                _ => Self::say(game, "Use targets hostile or all."),
++            },
++            [_, _, _, "oretype", value] => {
++                if [
++                    "diamond", "iron", "gold", "redstone", "emerald", "coal", "copper", "lapis",
++                    "quartz", "debris",
++                ]
++                .contains(value)
++                {
++                    self.ore_type = (*value).into();
++                    self.invalidate_scan();
++                    Self::say(game, format!("Ore type: {value}."));
++                } else {
++                    Self::say(
++                        game,
++                        "Unknown ore type. Try diamond, iron, gold, redstone, emerald, coal, copper, lapis, quartz, debris.",
++                    );
++                }
++            }
++            [_, _, _, "oreradius", value] => {
++                if let Some(n) = number(value, 4.0, 128.0).filter(|n| n.fract() == 0.0) {
++                    self.ore_radius = n as i32;
++                    self.invalidate_scan();
++                    Self::say(game, format!("Ore scan radius: {n} blocks."));
++                } else {
++                    Self::say(game, "Ore radius must be an integer from 4 to 128.");
++                }
++            }
++            [_, _, _, "friends", "select"] => {
++                self.disable_active(game, event_loop);
++                game.impact_clear_queued_attack();
++                self.friends_selecting = true;
++                Self::say(
++                    game,
++                    "Свои: наведитесь на игрока и нажмите ЛКМ. Удар не наносится.",
++                );
++            }
++            [_, _, _, "friends", "list"] => {
++                let mut names: Vec<_> = self
++                    .friends
++                    .values()
++                    .map(|name| {
++                        name.chars()
++                            .filter(|c| !c.is_control())
++                            .take(32)
++                            .collect::<String>()
++                    })
++                    .collect();
++                names.sort_unstable();
++                let total = names.len();
++                if total == 0 {
++                    Self::say(game, "Список своих пуст.");
++                } else {
++                    names.truncate(16);
++                    let extra = if total > names.len() {
++                        format!(" (и ещё {})", total - names.len())
++                    } else {
++                        String::new()
++                    };
++                    Self::say(game, format!("Свои ({total}): {}{extra}", names.join(", ")));
++                }
++            }
++            [_, _, _, "friends", "clear"] => {
++                self.friends.clear();
++                self.friends_selecting = false;
++                if let Err(e) = self.save_friends() {
++                    Self::say(game, format!("Не удалось сохранить список: {e}"));
++                } else {
++                    Self::say(game, "Список своих очищен.");
++                }
++            }
++            [_, _, _, "bridgeselect"] => {
++                self.disable_active(game, event_loop);
++                self.bridge_selecting = true;
++                Self::say(
++                    game,
++                    "Мост: посмотрите на первый прочный блок и нажмите ПКМ.",
++                );
++            }
++            [_, _, _, "crits", value] => {
++                if let Some(on) = switch(value) {
++                    self.crits = on;
++                    if !on {
++                        self.cancel_critical(game);
++                    }
++                    Self::say(game, format!("AutoCrit: {}", if on { "ON" } else { "OFF" }));
++                }
++            }
++            [_, _, _, mode @ ("pattack" | "pbow"), value] => {
++                if let Some(on) = switch(value) {
++                    self.disable_active(game, event_loop);
++                    if *mode == "pattack" {
++                        self.player_attack = on;
++                    } else {
++                        self.player_bow = on;
++                    }
++                    Self::say(
++                        game,
++                        format!(
++                            "{mode}: {} (friends excluded)",
++                            if on { "ON" } else { "OFF" }
++                        ),
++                    );
++                }
++            }
++            [_, _, _, mode @ ("aim" | "bow" | "mine"), value] => {
++                if let Some(on) = switch(value) {
++                    self.disable_active(game, event_loop);
++                    match *mode {
++                        "aim" => self.aim = on,
++                        "bow" => self.bow = on,
++                        "mine" => {
++                            self.mine = on;
++                            if on {
++                                self.ore = true;
++                                self.invalidate_scan();
++                            }
++                        }
++                        _ => {}
++                    }
++                    Self::say(game, format!("{mode}: {}", if on { "ON" } else { "OFF" }));
++                } else {
++                    Self::say(game, "Use on or off.");
++                }
++            }
++            _ => Self::say(game, "Unknown native request."),
++        }
++        self.last_update = None;
++    }
++    /// Cancel the incremental pass whenever the type, dimension, position or
++    /// block under the miner changes; stale positions must not be mined again.
++    fn invalidate_scan(&mut self) {
++        self.scan = None;
++        self.scan_anchor = None;
++        self.last_scan = None;
++        self.nearest_ore = None;
++        self.ore_results.clear();
++    }
++
++    fn begin_scan(&mut self, game: &Game<'_>) {
++        let Some(eye) = game.eye_position() else {
++            return;
++        };
++        let r = self.ore_radius;
++        let center = eye.map(|x| x.floor() as i32);
++        let mut work = Vec::new();
++        let ymin = ((center[1] - r - MIN_Y) >> 4).clamp(0, SECTIONS as i32 - 1);
++        let ymax = ((center[1] + r - MIN_Y) >> 4).clamp(0, SECTIONS as i32 - 1);
++        for cx in ((center[0] - r) >> 4)..=((center[0] + r) >> 4) {
++            for cz in ((center[2] - r) >> 4)..=((center[2] + r) >> 4) {
++                if !game.world.chunks.contains_key(&(cx, cz)) {
++                    continue;
++                }
++                for sy in ymin..=ymax {
++                    let lower = math::section_distance2(eye, [cx * 16, MIN_Y + sy * 16, cz * 16]);
++                    if lower <= f64::from(r).powi(2) {
++                        work.push((lower, cx, sy as usize, cz));
++                    }
++                }
++            }
++        }
++        // Nearest sections first: close ores can be used before the rest of a
++        // 128-block scan has finished, without waiting for distant sections.
++        work.sort_by(|a, b| a.0.total_cmp(&b.0));
++        self.nearest_ore = None;
++        self.ore_results.clear();
++        self.scan_anchor = Some((eye, game.dim.id().to_owned()));
++        self.scan = Some(OreScan {
++            eye,
++            dimension: game.dim.id().to_owned(),
++            radius: r,
++            sections: work.into_iter().map(|(_, x, y, z)| (x, y, z)).collect(),
++            cursor: 0,
++            found: Vec::new(),
++        });
++    }
++
++    fn scan_slice(&mut self, game: &Game<'_>) {
++        let Some(eye) = game.eye_position() else {
++            return;
++        };
++        let stale = self.scan_anchor.as_ref().is_some_and(|(start, dimension)| {
++            let moved2: f64 = (0..3).map(|i| (eye[i] - start[i]).powi(2)).sum();
++            moved2 > 64.0 || dimension != game.dim.id()
++        }) || self
++            .scan
++            .as_ref()
++            .is_some_and(|s| s.radius != self.ore_radius || s.dimension != game.dim.id());
++        if stale {
++            self.invalidate_scan();
++        }
++        if self.scan.is_none() && elapsed(self.last_scan, Duration::from_secs(SCAN_SECONDS)) {
++            self.begin_scan(game);
++        }
++        let Some(scan) = self.scan.as_mut() else {
++            return;
++        };
++        let started = Instant::now();
++        let mut sections = 0;
++        let mut unpacked = [0u32; 4096];
++        while scan.cursor < scan.sections.len() && sections < SCAN_SECTIONS_PER_CALL {
++            if sections > 0 && started.elapsed().as_micros() >= SCAN_BUDGET_MICROS {
++                break;
++            }
++            let (cx, sy, cz) = scan.sections[scan.cursor];
++            scan.cursor += 1;
++            sections += 1;
++            let Some(section) = game
++                .world
++                .chunks
++                .get(&(cx, cz))
++                .and_then(|c| c.sections.get(sy))
++            else {
++                continue;
++            };
++            // Most sections have a small palette; skip all 4096 blocks when
++            // no palette entry could be this ore. A global palette is scanned
++            // directly to avoid enumerating tens of thousands of unused IDs.
++            if !section.blocks.is_global()
++                && !section.blocks.maybe_has(|state| {
++                    ore_matches(
++                        &self.ore_type,
++                        &game.res.facts().get(BlockStateId(state)).name,
++                    )
++                })
++            {
++                continue;
++            }
++            section.unpack(&mut unpacked);
++            for (i, &state) in unpacked.iter().enumerate() {
++                if !ore_matches(
++                    &self.ore_type,
++                    &game.res.facts().get(BlockStateId(state)).name,
++                ) {
++                    continue;
++                }
++                let pos = [
++                    cx * 16 + (i as i32 & 15),
++                    MIN_Y + sy as i32 * 16 + ((i as i32 >> 8) & 15),
++                    cz * 16 + ((i as i32 >> 4) & 15),
++                ];
++                let d2: f64 = (0..3)
++                    .map(|a| (f64::from(pos[a]) + 0.5 - scan.eye[a]).powi(2))
++                    .sum();
++                if d2 > f64::from(scan.radius).powi(2) {
++                    continue;
++                }
++                let index = scan.found.partition_point(|(_, d)| *d <= d2);
++                if index < MAX_ORE_RESULTS {
++                    scan.found.insert(index, (pos, d2));
++                    scan.found.truncate(MAX_ORE_RESULTS);
++                }
++            }
++        }
++        self.nearest_ore = scan.found.first().map(|v| v.0);
++        self.ore_results = scan.found.iter().map(|v| v.0).collect();
++        if scan.cursor >= scan.sections.len() {
++            self.scan = None;
++            self.last_scan = Some(Instant::now());
++        }
++    }
++
++    fn players<'a>(game: &'a Game<'_>) -> Vec<PlayerView<'a>> {
++        let mut out = Vec::new();
++        if let Some(host) = &game.lan {
++            for (conn, mob) in &host.models {
++                if let Some(g) = host.hub.guest(*conn)
++                    && host.hub.here(g)
++                    && g.loaded
++                    && !g.dead
++                    && !g.spectator()
++                {
++                    out.push(PlayerView {
++                        mob,
++                        uuid: g.uuid,
++                        name: g.name.clone(),
++                    });
++                }
++            }
++        }
++        for mob in &game.mobs {
++            if let Some((uuid, name)) = game.impact_remote_identity(mob.id) {
++                out.push(PlayerView { mob, uuid, name });
++            }
++        }
++        out
++    }
++    fn nearest_player(
++        &self,
++        game: &Game<'_>,
++        radius: f64,
++        through_walls: bool,
++    ) -> Option<(u32, [f64; 3], [f64; 3])> {
++        let p = game.player.as_ref()?;
++        Self::players(game)
++            .into_iter()
++            .filter(|v| v.mob.alive() && !self.friends.contains_key(&v.uuid))
++            .filter_map(|v| {
++                let d2 = (v.mob.position.x - p.position.x).powi(2)
++                    + (v.mob.position.y - p.position.y).powi(2)
++                    + (v.mob.position.z - p.position.z).powi(2);
++                let center = v.mob.center();
++                (d2 <= radius * radius && (through_walls || Self::visible(game, center)))
++                    .then_some((d2, v.mob.id, center, Self::mob_velocity(v.mob)))
++            })
++            .min_by(|a, b| a.0.total_cmp(&b.0))
++            .map(|(_, id, center, v)| (id, center, v))
++    }
++    /// Block direct hits and conservatively block sword sweeps/spear stabs
++    /// near a friend even when the centre of the ray is another entity.
++    fn friend_risk(&self, game: &Game<'_>) -> bool {
++        if self.friends.is_empty() {
++            return false;
++        }
++        let Some(eye) = game.eye_position() else {
++            return false;
++        };
++        let dir = super::view_vector(game.yaw, game.pitch);
++        let reach = if game.creative { 5.0 } else { 3.0 };
++        let area = game.held().is_some_and(|s| {
++            s.item.ends_with("_sword") || horizon_client::spear::Kinetic::of(&s.item).is_some()
++        });
++        Self::players(game)
++            .into_iter()
++            .filter(|p| p.mob.alive() && self.friends.contains_key(&p.uuid))
++            .any(|v| {
++                let c = v.mob.center();
++                let d2: f64 = (0..3).map(|a| (c[a] - eye[a]).powi(2)).sum();
++                super::ray_box(eye, dir, reach + 0.3, v.mob.bounds()).is_some()
++                    || (area && d2 <= 36.0)
++            })
++    }
++    fn load_friends(&mut self, game: &mut Game<'_>) {
++        self.friends_loaded = true;
++        let path = std::path::Path::new("impact-horizon-friends.json");
++        let Ok(data) = std::fs::read(path) else {
++            return;
++        };
++        if data.len() > 64 * 1024 {
++            Self::say(game, "Friend list is too large; not loaded.");
++            return;
++        }
++        let Ok(entries) = serde_json::from_slice::<Vec<(String, String)>>(&data) else {
++            Self::say(game, "Friend list is invalid; not loaded.");
++            return;
++        };
++        for (uuid, name) in entries.into_iter().take(512) {
++            if uuid.len() != 32 || name.len() > 128 || name.chars().any(char::is_control) {
++                continue;
++            }
++            if let Ok(id) = u128::from_str_radix(&uuid, 16) {
++                self.friends.insert(id, name);
++            }
++        }
++    }
++    fn save_friends(&self) -> Result<(), String> {
++        let mut entries: Vec<_> = self
++            .friends
++            .iter()
++            .map(|(id, name)| (format!("{id:032x}"), name))
++            .collect();
++        entries.sort_by(|a, b| a.0.cmp(&b.0));
++        let data = serde_json::to_vec(&entries).map_err(|e| e.to_string())?;
++        std::fs::write("impact-horizon-friends.json", data).map_err(|e| e.to_string())
++    }
++    fn select_friend(&mut self, game: &mut Game<'_>) {
++        game.impact_clear_queued_attack();
++        let candidate = game.impact_current_hit().and_then(|(id, _)| {
++            Self::players(game)
++                .into_iter()
++                .find(|p| p.mob.id == id)
++                .map(|p| (p.uuid, p.name))
++        });
++        if let Some((uuid, raw_name)) = candidate {
++            if self.friends.len() >= 512 && !self.friends.contains_key(&uuid) {
++                Self::say(game, "Список своих заполнен (максимум 512).");
++                return;
++            }
++            let name: String = raw_name
++                .chars()
++                .filter(|c| !c.is_control())
++                .take(32)
++                .collect();
++            let name = if name.is_empty() {
++                format!("{uuid:032x}")
++            } else {
++                name
++            };
++            self.friends.insert(uuid, name.clone());
++            self.friends_selecting = false;
++            if let Err(e) = self.save_friends() {
++                Self::say(
++                    game,
++                    format!("{name} добавлен только до выхода; ошибка сохранения: {e}"),
++                );
++            } else {
++                Self::say(
++                    game,
++                    format!("{name} добавлен в свои. UUID зависит от сервера."),
++                );
++            }
++        } else {
++            Self::say(
++                game,
++                "Наведитесь на видимого игрока в пределах удара и нажмите ЛКМ.",
++            );
++        }
++        self.last_update = None;
++    }
++    fn select_bridge_point(&mut self, game: &mut Game<'_>) {
++        let Some(pos) = game.pick().map(|h| h.pos) else {
++            Self::say(game, "Мост: наведитесь на существующий блок и нажмите ПКМ.");
++            return;
++        };
++        if !matches!(Self::nav_cell(game, pos), Cell::Solid { .. }) {
++            Self::say(
++                game,
++                "Мост: выберите прочный полный блок, не жидкость и не плиту.",
++            );
++            return;
++        }
++        let Some(first) = self.bridge_first else {
++            self.bridge_first = Some(pos);
++            Self::say(game, format!("Точка 1: {pos:?}. Выберите второй блок ПКМ."));
++            return;
++        };
++        let (mut a, mut b) = (first, pos);
++        if a[1] == b[1]
++            && let Some(p) = game.player.as_ref()
++        {
++            let d = |v: [i32; 3]| {
++                (p.position.x - (f64::from(v[0]) + 0.5)).powi(2)
++                    + (p.position.z - (f64::from(v[2]) + 0.5)).powi(2)
++            };
++            if d(b) < d(a) {
++                std::mem::swap(&mut a, &mut b);
++            }
++        }
++        match bridge::bridge_line(a, b) {
++            Ok(route) => {
++                let start = route[0];
++                self.bridge_selecting = false;
++                self.bridge_first = None;
++                self.bridge_build = Some(BridgeBuild {
++                    route,
++                    next: 1,
++                    waiting: true,
++                });
++                Self::say(
++                    game,
++                    format!(
++                        "Мост выбран. Встаньте в центр нижней начальной точки {start:?}, затем отпустите движение. STOP отменяет."
++                    ),
++                );
++            }
++            Err(e) => {
++                self.bridge_first = None;
++                Self::say(
++                    game,
++                    format!("Мост не начат: {e}. Выберите первую точку заново."),
++                );
++            }
++        }
++    }
++    fn mouse(&mut self, game: &mut Game<'_>, button: MouseButton, pressed: bool) -> bool {
++        if button == MouseButton::Left && !pressed && self.swallow_left_release {
++            self.swallow_left_release = false;
++            return true;
++        }
++        if button == MouseButton::Right && !pressed && self.swallow_right_release {
++            self.swallow_right_release = false;
++            return true;
++        }
++        if !pressed || game.screen != Screen::Playing || !game.focused {
++            return false;
++        }
++        if button == MouseButton::Left && self.friends_selecting {
++            self.swallow_left_release = true;
++            self.select_friend(game);
++            return true;
++        }
++        if button == MouseButton::Right && self.bridge_selecting {
++            self.swallow_right_release = true;
++            self.select_bridge_point(game);
++            return true;
++        }
++        if button == MouseButton::Left && self.crits {
++            if self.crit_pending.is_some() {
++                self.swallow_left_release = true;
++                return true;
++            }
++            if let Some((id, _)) = game.impact_current_hit()
++                && !self.friend_risk(game)
++                && self.begin_critical(game, id, true)
++            {
++                self.swallow_left_release = true;
++                return true;
++            }
++        }
++        false
++    }
++    fn cancel_critical(&mut self, game: &mut Game<'_>) {
++        self.crit_pending = None;
++        if self.crit_jump_owned && !game.physical_keys.contains(&KeyCode::Space) {
++            game.keys.remove(&KeyCode::Space);
++        }
++        self.crit_jump_owned = false;
++    }
++    fn crit_ready(game: &Game<'_>) -> bool {
++        // hand_strength advances on the actual local client; attack_ticks is
++        // only advanced in the in-frame server path, not remote clients.
++        game.hand_strength.scale(0.5, game.main_hand_attack_speed()) > 0.9
++    }
++    fn begin_critical(&mut self, game: &mut Game<'_>, target: u32, manual: bool) -> bool {
++        let Some(p) = game.player.as_ref() else {
++            return false;
++        };
++        if self.crit_pending.is_some()
++            || !p.ground.on_ground
++            || p.flying
++            || p.fall_flying
++            || p.sprinting
++            || p.fluids.was_touching_water
++            || game.riding.is_some()
++            || game.potions.effects.get("blindness").is_some()
++            || !Self::crit_ready(game)
++            || game.keys.contains(&KeyCode::Space)
++        {
++            return false;
++        }
++        let head = [
++            p.position.x.floor() as i32,
++            p.position.y.round() as i32 + 2,
++            p.position.z.floor() as i32,
++        ];
++        if Self::nav_cell(game, head) != Cell::Empty {
++            return false;
++        }
++        game.keys.insert(KeyCode::Space);
++        self.crit_jump_owned = true;
++        self.crit_pending = Some(CritPending {
++            target,
++            manual,
++            started: Instant::now(),
++            initial_yaw: game.yaw,
++            initial_pitch: game.pitch,
++        });
++        true
++    }
++    fn advance_critical(&mut self, game: &mut Game<'_>) {
++        let Some(job) = self.crit_pending.as_ref() else {
++            return;
++        };
++        let (id, manual, started, initial_yaw, initial_pitch) = (
++            job.target,
++            job.manual,
++            job.started,
++            job.initial_yaw,
++            job.initial_pitch,
++        );
++        let Some(p) = game.player.as_ref() else {
++            self.cancel_critical(game);
++            return;
++        };
++        if started.elapsed() > Duration::from_secs(2)
++            || p.flying
++            || p.fall_flying
++            || p.fluids.was_touching_water
++            || p.sprinting
++            || game.riding.is_some()
++            || game.potions.effects.get("blindness").is_some()
++        {
++            self.cancel_critical(game);
++            return;
++        }
++        let airborne = !p.ground.on_ground;
++        let falling =
++            airborne && p.fall_distance > 0.0 && p.velocity.y < 0.0 && Self::crit_ready(game);
++        if (airborne || started.elapsed() > Duration::from_millis(250)) && self.crit_jump_owned {
++            if !game.physical_keys.contains(&KeyCode::Space) {
++                game.keys.remove(&KeyCode::Space);
++            }
++            self.crit_jump_owned = false;
++        }
++        if !falling {
++            return;
++        }
++        // Rising changes the eye height even if the mouse was not moved, so
++        // the old crosshair can miss at the apex. Correct the aim only if a
++        // manual attacker has not substantially turned away in the meantime.
++        let yaw_delta = (game.yaw - initial_yaw + 180.0).rem_euclid(360.0) - 180.0;
++        let view_unchanged = yaw_delta.abs() <= 6.0 && (game.pitch - initial_pitch).abs() <= 6.0;
++        if (!manual || view_unchanged)
++            && let Some(center) = game.impact_center(id)
++        {
++            // attack_once rechecks actual ray reach, blocks, and friend risk
++            // after the correction; it uses the game's real input path.
++            self.attack_once(game, id, center);
++        }
++        self.cancel_critical(game);
++    }
++    /// For explicit bridges, water deep below the path is allowed; nearby
++    /// fluid, lava or a column open to the void is not.
++    fn bridge_below_safe(game: &Game<'_>, pos: [i32; 3]) -> bool {
++        if !game.world.chunks.contains_key(&(pos[0] >> 4, pos[2] >> 4)) {
++            return false;
++        }
++        for y in (MIN_Y..pos[1]).rev() {
++            let f = game.res.facts().get(game.world.block(pos[0], y, pos[2]));
++            if f.fluid == horizon_client::blocks::Fluid::Lava || &*f.name == "minecraft:lava" {
++                return false;
++            }
++            if f.full_collision {
++                return true;
++            }
++        }
++        false
++    }
++    fn edit_below_safe(&self, game: &Game<'_>, pos: [i32; 3]) -> bool {
++        if self.bridge_build.is_some() {
++            Self::bridge_below_safe(game, pos)
++        } else {
++            Self::nav_below_safe(game, pos)
++        }
++    }
++    fn advance_bridge(&mut self, game: &mut Game<'_>, event_loop: &ActiveEventLoop) {
++        let Some(build) = self.bridge_build.as_ref() else {
++            return;
++        };
++        if build.next >= build.route.len() {
++            self.bridge_build = None;
++            Self::say(game, "Мост построен.");
++            return;
++        }
++        let (current, next, waiting) = (
++            build.route[build.next - 1],
++            build.route[build.next],
++            build.waiting,
++        );
++        let Some(p) = game.player.as_ref() else {
++            return;
++        };
++        let (px, pz) = (p.position.x, p.position.z);
++        let on = |v: [i32; 3]| {
++            p.ground.on_ground
++                && !p.flying
++                && !p.fall_flying
++                // A player's footprint may be supported across a grid edge.
++                && (px - (f64::from(v[0]) + 0.5)).abs() < 0.78
++                && (pz - (f64::from(v[2]) + 0.5)).abs() < 0.78
++                && (p.position.y - f64::from(v[1] + 1)).abs() < 0.08
++                && matches!(Self::nav_cell(game, v), Cell::Solid { .. })
++        };
++        let at_current = on(current);
++        let at_next = on(next);
++        let current_ox = px - (f64::from(current[0]) + 0.5);
++        let current_oz = pz - (f64::from(current[2]) + 0.5);
++        let next_ox = px - (f64::from(next[0]) + 0.5);
++        let next_oz = pz - (f64::from(next[2]) + 0.5);
++        let horizontal_speed = p.velocity.x.hypot(p.velocity.z);
++        if waiting {
++            if !at_current
++                || horizontal_speed > 0.008
++                || current_ox.abs() > 0.20
++                || current_oz.abs() > 0.20
++            {
++                return;
++            }
++            if [
++                KeyCode::KeyW,
++                KeyCode::KeyA,
++                KeyCode::KeyS,
++                KeyCode::KeyD,
++                KeyCode::Space,
++                KeyCode::ShiftLeft,
++            ]
++            .iter()
++            .any(|k| game.physical_keys.contains(k))
++            {
++                return;
++            }
++            self.bridge_build.as_mut().unwrap().waiting = false;
++            Self::say(
++                game,
++                "Строительство моста началось. Не двигайтесь вручную; STOP отменяет.",
++            );
++        }
++        if !waiting
++            && [
++                KeyCode::KeyW,
++                KeyCode::KeyA,
++                KeyCode::KeyS,
++                KeyCode::KeyD,
++                KeyCode::Space,
++                KeyCode::ShiftLeft,
++            ]
++            .iter()
++            .any(|k| game.physical_keys.contains(k))
++        {
++            self.cancel_own(game, event_loop);
++            self.bridge_build = None;
++            Self::say(game, "Мост остановлен: нажато движение.");
++            return;
++        }
++        if at_next {
++            // A goto may report success while the player still has forward
++            // momentum. Let friction settle before another edge placement;
++            // otherwise crouch starts too late and can carry us off the block.
++            if horizontal_speed > 0.008 {
++                return;
++            }
++            if !matches!(Self::nav_cell(game, next), Cell::Solid { .. }) {
++                self.bridge_build = None;
++                Self::say(game, "Мост остановлен: опора исчезла.");
++                return;
++            }
++            // Never use a normal-speed goto to recenter on a one-block
++            // platform: momentum can overshoot the target and cause a fall.
++            if next_ox.abs() > 0.20 || next_oz.abs() > 0.20 {
++                self.bridge_centering = Some(BridgeCenter {
++                    support: next,
++                    started: Instant::now(),
++                });
++                return;
++            }
++            self.bridge_build.as_mut().unwrap().next += 1;
++            if self.bridge_build.as_ref().unwrap().next
++                >= self.bridge_build.as_ref().unwrap().route.len()
++            {
++                self.bridge_build = None;
++                Self::say(game, "Мост построен.");
++            }
++            return;
++        }
++        if !at_current {
++            let since = self.nav_airborne_since.get_or_insert_with(Instant::now);
++            if since.elapsed() < Duration::from_secs(2) {
++                return;
++            }
++            self.cancel_own(game, event_loop);
++            self.bridge_build = None;
++            Self::say(game, "Мост остановлен: игрок не находится на опоре.");
++            return;
++        }
++        self.nav_airborne_since = None;
++        // The rising-step retreat and other goto tasks can also finish while
++        // momentum remains on the current support. Wait before advancing.
++        if horizontal_speed > 0.008 {
++            return;
++        }
++        if current_ox.abs() > 0.20 || current_oz.abs() > 0.20 {
++            self.bridge_centering = Some(BridgeCenter {
++                support: current,
++                started: Instant::now(),
++            });
++            return;
++        }
++        let action = (|| -> Result<Step, String> {
++            if [
++                KeyCode::KeyW,
++                KeyCode::KeyA,
++                KeyCode::KeyS,
++                KeyCode::KeyD,
++                KeyCode::Space,
++                KeyCode::ShiftLeft,
++            ]
++            .iter()
++            .any(|k| game.physical_keys.contains(k))
++            {
++                return Err("manual movement".into());
++            }
++            if !Self::nav_safe(game, next) || !self.edit_below_safe(game, next) {
++                return Err("unloaded, dangerous, lava or open-to-void column".into());
++            }
++            for y in next[1] + 1..=next[1] + 2 {
++                if Self::nav_cell(game, [next[0], y, next[2]]) != Cell::Empty {
++                    return Err("headroom blocked; no automatic mining".into());
++                }
++            }
++            if next[1] > current[1]
++                && Self::nav_cell(game, [current[0], current[1] + 3, current[2]]) != Cell::Empty
++            {
++                return Err("not enough room to jump".into());
++            }
++            match Self::nav_cell(game, next) {
++                Cell::Solid { .. } => Ok(Step::Walk([next[0], next[1] + 1, next[2]])),
++                Cell::Empty => {
++                    if next[1] > current[1] {
++                        let lower = [next[0], next[1] - 1, next[2]];
++                        match Self::nav_cell(game, lower) {
++                            Cell::Empty => Ok(Step::Place(lower, true)),
++                            Cell::Solid { .. } => Ok(Step::Place(next, false)),
++                            Cell::Blocked => Err("lower support is obstructed".into()),
++                        }
++                    } else {
++                        Ok(Step::Place(next, false))
++                    }
++                }
++                Cell::Blocked => Err("block is not a full safe support".into()),
++            }
++        })();
++        let result = action.and_then(|step| self.execute_edit(game, event_loop, step));
++        if let Err(e) = result {
++            self.cancel_own(game, event_loop);
++            self.bridge_build = None;
++            Self::say(game, format!("Мост остановлен: {e}."));
++        }
++    }
++
++    fn advance_bridge_center(&mut self, game: &mut Game<'_>, event_loop: &ActiveEventLoop) {
++        let Some(job) = self.bridge_centering.as_ref() else {
++            return;
++        };
++        let (support, started) = (job.support, job.started);
++        let Some(p) = game.player.as_ref() else {
++            self.cancel_own(game, event_loop);
++            self.bridge_build = None;
++            return;
++        };
++        let ox = p.position.x - (f64::from(support[0]) + 0.5);
++        let oz = p.position.z - (f64::from(support[2]) + 0.5);
++        let speed = p.velocity.x.hypot(p.velocity.z);
++        let supported = p.ground.on_ground
++            && !p.flying
++            && !p.fall_flying
++            && (p.position.y - f64::from(support[1] + 1)).abs() < 0.08
++            && ox.abs() < 0.78
++            && oz.abs() < 0.78
++            && matches!(Self::nav_cell(game, support), Cell::Solid { .. });
++        let manual = [
++            KeyCode::KeyW,
++            KeyCode::KeyA,
++            KeyCode::KeyS,
++            KeyCode::KeyD,
++            KeyCode::Space,
++            KeyCode::ShiftLeft,
++        ]
++        .iter()
++        .any(|k| game.physical_keys.contains(k));
++        if started.elapsed() > Duration::from_secs(8) || !supported || manual {
++            self.cancel_own(game, event_loop);
++            self.bridge_build = None;
++            Self::say(
++                game,
++                "Мост остановлен при выравнивании: нет безопасной опоры или нажато движение.",
++            );
++            return;
++        }
++        // Sneak keeps the player on the supporting edge, and the lower speed
++        // prevents the repeated, high-momentum goto oscillations.
++        game.keys.insert(KeyCode::ShiftLeft);
++        if ox.abs().max(oz.abs()) > 0.12 {
++            let (dx, dz) = (-ox, -oz);
++            game.yaw = (-dx).atan2(dz).to_degrees() as f32;
++            game.keys.insert(KeyCode::KeyW);
++            return;
++        }
++        game.keys.remove(&KeyCode::KeyW);
++        if speed > 0.008 {
++            return;
++        }
++        game.keys.remove(&KeyCode::ShiftLeft);
++        self.bridge_centering = None;
++    }
++
++    pub(super) fn entity_glow_enabled(&self) -> bool {
++        self.visual_glow
++    }
++
++    fn set_xray(&mut self, game: &mut Game<'_>, on: bool) {
++        self.visual_xray = on;
++        let states = if self.xray_rules.is_empty() {
++            Vec::new()
++        } else {
++            game.res
++                .facts()
++                .states
++                .iter()
++                .map(|state| {
++                    self.xray_rules
++                        .iter()
++                        .find(|(name, _)| name.as_str() == &*state.name)
++                        .map_or(-1, |(_, show)| if *show { 1 } else { 0 })
++                })
++                .collect()
++        };
++        if game
++            .streaming
++            .set_xray(&mut game.world, on, self.xray_mask, Arc::new(states))
++        {
++            game.pending_uploads.clear();
++            if let Some(renderer) = &mut game.renderer {
++                renderer.clear_sections();
++            }
++            game.clear_lod();
++            Self::say(
++                game,
++                if on {
++                    "X-Ray ON: terrain is hidden visually, collisions remain. Watch your step."
++                } else {
++                    "X-Ray OFF: rebuilding normal terrain."
++                },
++            );
++        }
++    }
++    fn read_visual_state(&mut self, game: &mut Game<'_>) {
++        let Some(raw) = game.mods.mods.impact_native_request("native_visual") else {
++            return;
++        };
++        let Ok(text) = std::str::from_utf8(&raw) else {
++            return;
++        };
++        let words: Vec<_> = text.trim().split('|').collect();
++        if let [
++            "v4",
++            session,
++            arc,
++            ore,
++            mob,
++            glow,
++            xray,
++            walls,
++            tracers,
++            mask,
++            rules,
++        ] = words.as_slice()
++            && *session == self.session
++            && let (
++                Some(arc),
++                Some(ore),
++                Some(mob),
++                Some(glow),
++                Some(xray),
++                Some(walls),
++                Some(tracers),
++                Ok(mask),
++                Some(rules),
++            ) = (
++                switch(arc),
++                switch(ore),
++                switch(mob),
++                switch(glow),
++                switch(xray),
++                switch(walls),
++                switch(tracers),
++                mask.parse::<u32>(),
++                xray_rules(rules),
++            )
++            && mask & !horizon_client::mesher::XRAY_ALL == 0
++        {
++            if ore != self.visual_ore {
++                self.invalidate_scan();
++            }
++            self.visual_arc = arc;
++            self.visual_ore = ore;
++            self.visual_mob = mob;
++            self.visual_glow = glow;
++            self.aim_walls = walls;
++            self.visual_tracers = tracers;
++            let changed =
++                xray != self.visual_xray || mask != self.xray_mask || rules != self.xray_rules;
++            self.xray_mask = mask;
++            self.xray_rules = rules;
++            if changed {
++                self.set_xray(game, xray);
++            }
++        }
++    }
++
++    /// The entire sight ray must stay in loaded chunks; unknown is not air.
++    fn visible(game: &Game<'_>, target: [f64; 3]) -> bool {
++        let Some(eye) = game.eye_position() else {
++            return false;
++        };
++        let d = std::array::from_fn::<_, 3, _>(|i| target[i] - eye[i]);
++        let len = d.iter().map(|v| v * v).sum::<f64>().sqrt();
++        if !len.is_finite() || len < 1.0e-6 {
++            return false;
++        }
++        let dir = d.map(|v| v / len);
++        // At <= half a block per sample no one-block chunk gap can be missed.
++        let steps = (len * 2.0).ceil() as usize;
++        for i in 0..=steps {
++            let t = (i as f64 / steps as f64) * len;
++            let x = (eye[0] + dir[0] * t).floor() as i32;
++            let z = (eye[2] + dir[2] * t).floor() as i32;
++            if !game.world.chunks.contains_key(&(x >> 4, z >> 4)) {
++                return false;
++            }
++        }
++        game.clip_ray(eye, dir, len).is_none()
++    }
++    /// (entity ID, center, observed velocity in blocks/game tick).
++    fn nearest_mob(
++        &self,
++        game: &Game<'_>,
++        radius: f64,
++        through_walls: bool,
++    ) -> Option<(u32, [f64; 3], [f64; 3])> {
++        let p = game.player.as_ref()?;
++        game.mobs
++            .iter()
++            .filter(|m| {
++                m.alive()
++                    && m.kind.id != "minecraft:player"
++                    && game.impact_remote_identity(m.id).is_none()
++                    && (self.all_mobs || hostile(&m.kind.id))
++            })
++            .filter_map(|m| {
++                let dx = m.position.x - p.position.x;
++                let dy = m.position.y - p.position.y;
++                let dz = m.position.z - p.position.z;
++                let d2 = dx * dx + dy * dy + dz * dz;
++                let center = m.center();
++                (d2 <= radius * radius && (through_walls || Self::visible(game, center)))
++                    .then_some((d2, m.id, center, Self::mob_velocity(m)))
++            })
++            .min_by(|a, b| a.0.total_cmp(&b.0))
++            .map(|(_, id, center, velocity)| (id, center, velocity))
++    }
++    fn mob_velocity(m: &horizon_client::mobs::Mob) -> [f64; 3] {
++        let observed = [
++            m.position.x - m.previous.x,
++            m.position.y - m.previous.y,
++            m.position.z - m.previous.z,
++        ];
++        let actual = [m.velocity.x, m.velocity.y, m.velocity.z];
++        let mut v = if observed.iter().all(|x| x.is_finite())
++            && observed.iter().map(|x| x * x).sum::<f64>() > 1e-8
++        {
++            observed
++        } else {
++            actual
++        };
++        if m.on_ground {
++            v[1] = 0.0;
++        }
++        for x in &mut v {
++            if !x.is_finite() {
++                *x = 0.0;
++            }
++            *x = x.clamp(-1.0, 1.0);
++        }
++        v
++    }
++    fn shooter_velocity(game: &Game<'_>) -> [f64; 3] {
++        game.player.as_ref().map_or([0.0; 3], |p| {
++            [
++                p.velocity.x,
++                if p.ground.on_ground {
++                    0.0
++                } else {
++                    p.velocity.y
++                },
++                p.velocity.z,
++            ]
++        })
++    }
++
++    fn arrived(game: &Game<'_>, goal: [f64; 3]) -> bool {
++        game.player.as_ref().is_some_and(|p| {
++            p.ground.on_ground
++                && !p.flying
++                && !p.fall_flying
++                && (p.position.x - goal[0]).hypot(p.position.z - goal[2]) <= 0.8
++                && (p.position.y - goal[1]).abs() <= 0.8
++        })
++    }
++    fn segment_standable(game: &Game<'_>, x: i32, y: i32, z: i32) -> bool {
++        if y < MIN_Y + 1
++            || y >= MIN_Y + 16 * SECTIONS as i32 - 2
++            || !game.world.chunks.contains_key(&(x >> 4, z >> 4))
++        {
++            return false;
++        }
++        let facts = game.res.facts();
++        let below = facts.get(game.world.block(x, y - 1, z));
++        let feet = facts.get(game.world.block(x, y, z));
++        let head = facts.get(game.world.block(x, y + 1, z));
++        let solid = |f: &horizon_client::blocks::StateFacts| f.full_collision || f.legacy_solid;
++        let dangerous = |f: &horizon_client::blocks::StateFacts| &*f.name == "minecraft:lava";
++        (solid(below) || below.fluid != horizon_client::blocks::Fluid::None)
++            && !solid(feet)
++            && !solid(head)
++            && !dangerous(below)
++            && !dangerous(feet)
++    }
++    /// Pick a standable local waypoint in loaded terrain, never a blind
++    /// straight-line walk. The real Horizon A* verifies each segment.
++    fn next_nav_segment(game: &Game<'_>, goal: [f64; 3]) -> Option<[f64; 3]> {
++        let p = game.player.as_ref()?.position;
++        let dx = goal[0] - p.x;
++        let dz = goal[2] - p.z;
++        let horizontal = dx.hypot(dz);
++        if horizontal <= NAV_SEGMENT + 2.0 {
++            return Some(goal);
++        }
++        for length in [NAV_SEGMENT, 20.0, 16.0, 12.0, 8.0] {
++            let t = length / horizontal;
++            let x = (p.x + dx * t).floor() as i32;
++            let z = (p.z + dz * t).floor() as i32;
++            let y = (p.y + (goal[1] - p.y) * t).round() as i32;
++            for ring in 0i32..=3 {
++                for ox in -ring..=ring {
++                    for oz in -ring..=ring {
++                        if ox.abs().max(oz.abs()) != ring {
++                            continue;
++                        }
++                        for oy in [0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 8, -8] {
++                            let (xx, yy, zz) = (x + ox, y + oy, z + oz);
++                            if Self::segment_standable(game, xx, yy, zz) {
++                                return Some([
++                                    f64::from(xx) + 0.5,
++                                    f64::from(yy),
++                                    f64::from(zz) + 0.5,
++                                ]);
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        None
++    }
++
++    fn nav_material(game: &Game<'_>) -> Option<String> {
++        game.inventory[..9].iter().flatten().find_map(|s| {
++            let id = s.item.strip_prefix("minecraft:").unwrap_or(&s.item);
++            (s.count > 0
++                && (matches!(
++                    id,
++                    "dirt"
++                        | "cobblestone"
++                        | "stone"
++                        | "cobbled_deepslate"
++                        | "deepslate"
++                        | "netherrack"
++                        | "end_stone"
++                ) || id.ends_with("_planks")))
++            .then(|| s.item.to_string())
++        })
++    }
++    fn diggable(name: &str) -> bool {
++        matches!(
++            name.strip_prefix("minecraft:").unwrap_or(name),
++            "stone"
++                | "cobblestone"
++                | "deepslate"
++                | "cobbled_deepslate"
++                | "tuff"
++                | "andesite"
++                | "diorite"
++                | "granite"
++                | "dirt"
++                | "coarse_dirt"
++                | "grass_block"
++                | "rooted_dirt"
++                | "mud"
++                | "netherrack"
++                | "end_stone"
++                | "sandstone"
++                | "red_sandstone"
++        )
++    }
++    fn needs_pick(name: &str) -> bool {
++        !matches!(
++            name.strip_prefix("minecraft:").unwrap_or(name),
++            "dirt" | "coarse_dirt" | "grass_block" | "rooted_dirt" | "mud"
++        )
++    }
++    fn select_dig_tool(game: &mut Game<'_>, pos: [i32; 3]) -> Result<(), String> {
++        let name = game
++            .res
++            .facts()
++            .get(game.world.block(pos[0], pos[1], pos[2]))
++            .name
++            .to_string();
++        if !Self::diggable(&name) {
++            return Err("block is not on the safe mining list".into());
++        }
++        let suffix = if Self::needs_pick(&name) {
++            "_pickaxe"
++        } else {
++            "_shovel"
++        };
++        if let Some(i) = (0..9).find(|&i| {
++            game.inventory[i]
++                .as_ref()
++                .is_some_and(|s| s.count > 0 && s.item.ends_with(suffix))
++        }) {
++            game.selected = i;
++        } else if Self::needs_pick(&name) && !game.creative {
++            return Err("a pickaxe is required in the hotbar".into());
++        } else if game.held().is_some_and(|s| s.item.ends_with("_sword")) {
++            if let Some(i) = (0..9).find(|&i| game.inventory[i].is_none()) {
++                game.selected = i;
++            } else {
++                return Err("select a non-sword tool for mining".into());
++            }
++        }
++        Ok(())
++    }
++    /// Conservative: blocks around the path, including one below, must not
++    /// contain fire, fluid or lava. Unknown neighbouring chunks are unsafe.
++    fn nav_safe(game: &Game<'_>, pos: [i32; 3]) -> bool {
++        if pos[1] < MIN_Y + 1 || pos[1] >= MIN_Y + 16 * SECTIONS as i32 - 3 {
++            return false;
++        }
++        for [dx, dz] in [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]] {
++            let (x, z) = (pos[0] + dx, pos[2] + dz);
++            if !game.world.chunks.contains_key(&(x >> 4, z >> 4)) {
++                return false;
++            }
++            for y in pos[1] - 1..=pos[1] + 1 {
++                let f = game.res.facts().get(game.world.block(x, y, z));
++                let name = f.name.strip_prefix("minecraft:").unwrap_or(&f.name);
++                if f.fluid != horizon_client::blocks::Fluid::None
++                    || matches!(
++                        name,
++                        "lava"
++                            | "water"
++                            | "fire"
++                            | "soul_fire"
++                            | "magma_block"
++                            | "cactus"
++                            | "campfire"
++                            | "soul_campfire"
++                            | "powder_snow"
++                            | "sweet_berry_bush"
++                    )
++                {
++                    return false;
++                }
++            }
++        }
++        true
++    }
++    /// Before building over a shaft, look down the exposed loaded column. A
++    /// solid floor shields anything below it; a visible lava/water column is
++    /// not bridged, even when the fluid is several blocks below the edge.
++    fn nav_below_safe(game: &Game<'_>, pos: [i32; 3]) -> bool {
++        if !game.world.chunks.contains_key(&(pos[0] >> 4, pos[2] >> 4)) {
++            return false;
++        }
++        for y in (MIN_Y..pos[1]).rev() {
++            let f = game.res.facts().get(game.world.block(pos[0], y, pos[2]));
++            if f.fluid != horizon_client::blocks::Fluid::None || &*f.name == "minecraft:lava" {
++                return false;
++            }
++            if f.full_collision {
++                return true;
++            }
++        }
++        // Never build a bridge above a column open to the bottom of the world.
++        false
++    }
++    fn nav_cell(game: &Game<'_>, pos: [i32; 3]) -> Cell {
++        if pos[1] < MIN_Y
++            || pos[1] >= MIN_Y + 16 * SECTIONS as i32
++            || !game.world.chunks.contains_key(&(pos[0] >> 4, pos[2] >> 4))
++        {
++            return Cell::Blocked;
++        }
++        let state = game.world.block(pos[0], pos[1], pos[2]);
++        let f = game.res.facts().get(state);
++        if game.res.facts().is_air(state) {
++            Cell::Empty
++        } else if f.fluid == horizon_client::blocks::Fluid::None && f.full_collision {
++            Cell::Solid {
++                breakable: Self::diggable(&f.name),
++            }
++        } else {
++            Cell::Blocked
++        }
++    }
++    fn plan_edit(game: &Game<'_>, target: [f64; 3]) -> Option<Step> {
++        let p = game.player.as_ref()?;
++        if p.flying || p.fall_flying || !p.ground.on_ground {
++            return None;
++        }
++        let from = [
++            p.position.x.floor() as i32,
++            p.position.y.round() as i32,
++            p.position.z.floor() as i32,
++        ];
++        let cells = std::cell::RefCell::new(std::collections::HashMap::new());
++        let safe = std::cell::RefCell::new(std::collections::HashMap::new());
++        let cell = |pos| {
++            *cells
++                .borrow_mut()
++                .entry(pos)
++                .or_insert_with(|| Self::nav_cell(game, pos))
++        };
++        let is_safe = |pos| {
++            *safe
++                .borrow_mut()
++                .entry(pos)
++                .or_insert_with(|| Self::nav_safe(game, pos) && Self::nav_below_safe(game, pos))
++        };
++        nav::plan(
++            from,
++            target,
++            Self::nav_material(game).is_some(),
++            cell,
++            is_safe,
++        )
++    }
++    fn begin_edge(
++        game: &mut Game<'_>,
++        target: [i32; 3],
++        item: String,
++        rising: bool,
++    ) -> Result<NavEdge, String> {
++        let p = game.player.as_ref().ok_or("no player")?;
++        if p.flying || p.fall_flying || !p.ground.on_ground {
++            return Err("stand on a full block; disable flight".into());
++        }
++        let y = p.position.y.round() as i32;
++        if (p.position.y - f64::from(y)).abs() > 0.05 {
++            return Err("building needs a level full-block support".into());
++        }
++        let support = [
++            p.position.x.floor() as i32,
++            y - 1,
++            p.position.z.floor() as i32,
++        ];
++        let (dx, dz) = (target[0] - support[0], target[2] - support[2]);
++        if target[1] != support[1] || dx.abs() + dz.abs() != 1 {
++            return Err("no reachable support face".into());
++        }
++        if !matches!(Self::nav_cell(game, support), Cell::Solid { .. })
++            || Self::nav_cell(game, target) != Cell::Empty
++            || !Self::nav_safe(game, target)
++        {
++            return Err("the edge or target is not safe".into());
++        }
++        let cx = p.position.x - (f64::from(support[0]) + 0.5);
++        let cz = p.position.z - (f64::from(support[2]) + 0.5);
++        if cx.abs() > if dx != 0 { 0.30 } else { 0.20 }
++            || cz.abs() > if dz != 0 { 0.30 } else { 0.20 }
++        {
++            return Err("center on the supporting block first".into());
++        }
++        if [
++            KeyCode::KeyW,
++            KeyCode::KeyA,
++            KeyCode::KeyS,
++            KeyCode::KeyD,
++            KeyCode::Space,
++            KeyCode::ShiftLeft,
++        ]
++        .iter()
++        .any(|k| game.physical_keys.contains(k))
++        {
++            return Err("release movement keys before building".into());
++        }
++        Ok(NavEdge {
++            target,
++            support,
++            dx,
++            dz,
++            item,
++            rising,
++            started: Instant::now(),
++            settled: None,
++        })
++    }
++    fn advance_edge(&mut self, game: &mut Game<'_>, event_loop: &ActiveEventLoop) {
++        let Some(mut edge) = self.nav_edge.take() else {
++            return;
++        };
++        let result = (|| -> Result<bool, String> {
++            let p = game.player.as_ref().ok_or("no player")?;
++            if edge.started.elapsed() > Duration::from_secs(4)
++                || !p.ground.on_ground
++                || p.flying
++                || p.fall_flying
++                || (p.position.y - f64::from(edge.support[1] + 1)).abs() > 0.06
++                || !matches!(Self::nav_cell(game, edge.support), Cell::Solid { .. })
++                || Self::nav_cell(game, edge.target) != Cell::Empty
++                || !Self::nav_safe(game, edge.target)
++                || !self.edit_below_safe(game, edge.target)
++            {
++                return Err("edge became unsafe or timed out".into());
++            }
++            if [
++                KeyCode::KeyW,
++                KeyCode::KeyA,
++                KeyCode::KeyS,
++                KeyCode::KeyD,
++                KeyCode::Space,
++                KeyCode::ShiftLeft,
++            ]
++            .iter()
++            .any(|k| game.physical_keys.contains(k))
++            {
++                return Err("manual movement interrupted construction".into());
++            }
++            let cx = p.position.x - (f64::from(edge.support[0]) + 0.5);
++            let cz = p.position.z - (f64::from(edge.support[2]) + 0.5);
++            let progress = cx * f64::from(edge.dx) + cz * f64::from(edge.dz);
++            let cross = cx * f64::from(edge.dz) - cz * f64::from(edge.dx);
++            if cross.abs() > 0.23 || progress > 0.78 {
++                return Err("unexpected displacement near edge".into());
++            }
++            game.keys.insert(KeyCode::ShiftLeft);
++            // Barely over the edge is enough with the near-face ray sample;
++            // leave a margin for normal momentum if STOP/focus loss occurs.
++            if progress < 0.53 {
++                game.yaw = (-(edge.dx as f64)).atan2(edge.dz as f64).to_degrees() as f32;
++                game.keys.insert(KeyCode::KeyW);
++                return Ok(false);
++            }
++            game.keys.remove(&KeyCode::KeyW);
++            let since = *edge.settled.get_or_insert_with(Instant::now);
++            if since.elapsed() < Duration::from_millis(120) {
++                return Ok(false);
++            }
++            let [x, y, z] = edge.target;
++            self.do_action(
++                game,
++                event_loop,
++                format!("place {x} {y} {z} --item {}", edge.item),
++                TaskKind::NavEdit,
++            )?;
++            if edge.rising {
++                self.nav_retreat = Some((edge.support, edge.dx, edge.dz));
++            }
++            // Shift stays held until the place task confirms the block; the
++            // task's ordinary release_agent_keys then releases it.
++            Ok(true)
++        })();
++        match result {
++            Ok(true) => {}
++            Ok(false) => self.nav_edge = Some(edge),
++            Err(e) => {
++                self.nav_edge = Some(edge);
++                self.cancel_own(game, event_loop);
++                self.queued_nav = None;
++                self.nav_started = false;
++                self.bridge_build = None;
++                Self::say(game, format!("Navigation stopped: {e}."));
++            }
++        }
++    }
++    fn execute_edit(
++        &mut self,
++        game: &mut Game<'_>,
++        event_loop: &ActiveEventLoop,
++        step: Step,
++    ) -> Result<(), String> {
++        match step {
++            Step::Walk([x, y, z]) => {
++                let p = game.player.as_ref().ok_or("no player")?.position;
++                let dx = (x - p.x.floor() as i32).clamp(-1, 1);
++                let dz = (z - p.z.floor() as i32).clamp(-1, 1);
++                // A bridge has no floor beyond the target. Stop on its near
++                // half, not its far half: on a jump the goto task can finish
++                // with enough momentum to carry the player across the edge.
++                let bias = if self.bridge_build.is_some() {
++                    -0.18
++                } else {
++                    0.18
++                };
++                self.do_action(
++                    game,
++                    event_loop,
++                    format!(
++                        "goto {} {} {} --near 0.3 --strict-y --timeout 12",
++                        f64::from(x) + 0.5 + bias * f64::from(dx),
++                        f64::from(y),
++                        f64::from(z) + 0.5 + bias * f64::from(dz)
++                    ),
++                    TaskKind::Navigate,
++                )
++            }
++            Step::Break(pos) => {
++                if !Self::nav_safe(game, pos) || !Self::nav_below_safe(game, pos) {
++                    return Err("unsafe block near or above fluid or lava".into());
++                }
++                Self::select_dig_tool(game, pos)?;
++                let [x, y, z] = pos;
++                self.do_action(
++                    game,
++                    event_loop,
++                    format!("break {x} {y} {z} --timeout 25"),
++                    TaskKind::NavEdit,
++                )
++            }
++            Step::Place(pos, rising) => {
++                if !Self::nav_safe(game, pos) || !self.edit_below_safe(game, pos) {
++                    return Err("unsafe placement near or above fluid or lava".into());
++                }
++                let item =
++                    Self::nav_material(game).ok_or("place full building blocks in the hotbar")?;
++                let [x, y, z] = pos;
++                let line = format!("place {x} {y} {z} --item {item}");
++                if self
++                    .do_action(game, event_loop, line, TaskKind::NavEdit)
++                    .is_err()
++                {
++                    self.nav_edge = Some(Self::begin_edge(game, pos, item, rising)?);
++                }
++                Ok(())
++            }
++        }
++    }
++
++    /// A normal input click, with the same targeting/occlusion/reach checks as
++    /// the game. Do not touch a player's physically held left mouse button.
++    fn attack_once(&self, game: &mut Game<'_>, id: u32, center: [f64; 3]) {
++        if game.left {
++            return;
++        }
++        let Some(eye) = game.eye_position() else {
++            return;
++        };
++        let d = [center[0] - eye[0], center[1] - eye[1], center[2] - eye[2]];
++        let horizontal = d[0].hypot(d[2]);
++        if horizontal < 1e-6 {
++            return;
++        }
++        game.yaw = (-d[0]).atan2(d[2]).to_degrees() as f32;
++        game.pitch = (-d[1]).atan2(horizontal).to_degrees().clamp(-90.0, 90.0) as f32;
++        if game.impact_current_hit().is_none_or(|(hit, _)| hit != id) || self.friend_risk(game) {
++            return;
++        }
++        // The user's Toggle Attack option must not leave our synthetic click
++        // latched down. Restore the setting immediately after both events.
++        let toggle = game.settings.toggle_attack;
++        game.settings.toggle_attack = false;
++        if game.play_mouse(MouseButton::Left, true).is_ok() {
++            let _ = game.play_mouse(MouseButton::Left, false);
++        }
++        game.settings.toggle_attack = toggle;
++    }
++
++    /// Depth-tested world-space trajectory plus optional through-wall ESP.
++    /// Simulates a bounded preview, not the server's random arrow spread.
++    pub(super) fn world_visuals(
++        &self,
++        game: &Game<'_>,
++        camera: [f64; 3],
++        view_yaw: f32,
++        view_pitch: f32,
++    ) -> Gizmos {
++        let mut g = Gizmos::default();
++        if game.title.is_some() || game.player.is_none() {
++            return g;
++        }
++        if self.visual_arc
++            && let Some(eye) = game.eye_position()
++            && let Some(held) = game.held()
++        {
++            let item = held.item.as_ref();
++            let (speed, is_arrow) = match item {
++                "minecraft:bow" => (
++                    game.using.map_or(3.0, |(_, ticks)| math::bow_speed(ticks)),
++                    true,
++                ),
++                "minecraft:crossbow" => (3.15, true),
++                "minecraft:snowball" | "minecraft:egg" | "minecraft:ender_pearl" => (1.5, false),
++                _ => (0.0, true),
++            };
++            if speed >= 0.3 {
++                let view = super::view_vector(game.yaw, game.pitch);
++                let inherit = Self::shooter_velocity(game);
++                let mut velocity = std::array::from_fn::<_, 3, _>(|a| view[a] * speed + inherit[a]);
++                let mut position = [eye[0], eye[1] - 0.1, eye[2]];
++                let mut travelled = 0.0;
++                for tick in 0..80 {
++                    let b = position.map(|v| v.floor() as i32);
++                    if b[1] < MIN_Y
++                        || b[1] >= MIN_Y + SECTIONS as i32 * 16
++                        || !game.world.chunks.contains_key(&(b[0] >> 4, b[2] >> 4))
++                    {
++                        break;
++                    }
++                    let water = game
++                        .res
++                        .facts()
++                        .get(game.world.block(b[0], b[1], b[2]))
++                        .fluid
++                        == horizon_client::blocks::Fluid::Water;
++                    if !is_arrow {
++                        let drag = if water { 0.8 } else { 0.99 };
++                        velocity = [
++                            velocity[0] * drag,
++                            (velocity[1] - 0.03) * drag,
++                            velocity[2] * drag,
++                        ];
++                    }
++                    let next = std::array::from_fn::<_, 3, _>(|a| position[a] + velocity[a]);
++                    let len = velocity.iter().map(|v| v * v).sum::<f64>().sqrt();
++                    if len < 1e-7 {
++                        break;
++                    }
++                    let dir = velocity.map(|v| v / len);
++                    let mut end = next;
++                    let mut hit_at = len + 1.0;
++                    if let Some(hit) = game.clip_ray(position, dir, len) {
++                        let d = (0..3)
++                            .map(|a| (hit.point[a] - position[a]).powi(2))
++                            .sum::<f64>()
++                            .sqrt();
++                        hit_at = d;
++                        end = hit.point;
++                    }
++                    // Predict moving mobs at this point in flight. This is a
++                    // constant-velocity estimate, not server reconciliation.
++                    for m in game.mobs.iter().filter(|m| m.alive()) {
++                        let v = Self::mob_velocity(m);
++                        let delta = Vec3::new(
++                            v[0] * f64::from(tick),
++                            v[1] * f64::from(tick),
++                            v[2] * f64::from(tick),
++                        );
++                        let bounds = m.bounds().move_by(delta);
++                        if let Some(d) = super::ray_box(position, dir, len, bounds)
++                            && d < hit_at
++                        {
++                            hit_at = d;
++                            end = std::array::from_fn(|a| position[a] + dir[a] * d);
++                        }
++                    }
++                    let visible = math::trim_initial_path(position, end, travelled, 2.0);
++                    let actual_length = (0..3)
++                        .map(|a| (end[a] - position[a]).powi(2))
++                        .sum::<f64>()
++                        .sqrt();
++                    travelled += actual_length;
++                    if let Some(start) = visible {
++                        g.line(start, end, 0xFFFF_D84D, 2.5);
++                    }
++                    if hit_at <= len {
++                        if travelled < 2.0 {
++                            break;
++                        }
++                        let d = 0.16;
++                        for axis in 0..3 {
++                            let mut a = end;
++                            let mut b = end;
++                            a[axis] -= d;
++                            b[axis] += d;
++                            g.line(a, b, 0xFFFF_5555, 2.0);
++                        }
++                        break;
++                    }
++                    position = next;
++                    if is_arrow {
++                        velocity = math::arrow_next_velocity(velocity, water);
++                    }
++                }
++            }
++        }
++        if self.visual_arc
++            && self.bow
++            && game.using.is_some()
++            && let Some(lead) = self.last_lead
++        {
++            let at = lead.predicted_target;
++            for axis in 0..3 {
++                let mut a = at;
++                let mut b = at;
++                a[axis] -= 0.22;
++                b[axis] += 0.22;
++                g.on_top.push(Line {
++                    start: a,
++                    end: b,
++                    color: 0xFF55_FFFF,
++                    width: 2.5,
++                });
++            }
++        }
++        if self.visual_ore {
++            let mut boxes = Gizmos::default();
++            for &p in &self.ore_results {
++                if !game.world.chunks.contains_key(&(p[0] >> 4, p[2] >> 4)) {
++                    continue;
++                }
++                let state = game.world.block(p[0], p[1], p[2]);
++                if !ore_matches(&self.ore_type, &game.res.facts().get(state).name) {
++                    continue;
++                }
++                let min = p.map(|x| f64::from(x) - 0.01);
++                let max = p.map(|x| f64::from(x) + 1.01);
++                boxes.cuboid(min, max, 0xFF55_FFFF, 2.0);
++            }
++            g.on_top.extend(boxes.lines);
++        }
++        if self.visual_mob
++            && let Some(p) = game.player.as_ref()
++        {
++            let mut mobs: Vec<_> = game
++                .mobs
++                .iter()
++                .filter(|m| m.alive() && m.kind.id != "minecraft:player")
++                .filter_map(|m| {
++                    let d2 = (m.position.x - p.position.x).powi(2)
++                        + (m.position.y - p.position.y).powi(2)
++                        + (m.position.z - p.position.z).powi(2);
++                    (d2 <= self.aim_radius * self.aim_radius).then_some((d2, m))
++                })
++                .collect();
++            mobs.sort_by(|a, b| a.0.total_cmp(&b.0));
++            let mut boxes = Gizmos::default();
++            for (_, m) in mobs.into_iter().take(64) {
++                let b = m.bounds();
++                let lo = b.min_position();
++                let hi = b.max_position();
++                boxes.cuboid(
++                    [lo.x, lo.y, lo.z],
++                    [hi.x, hi.y, hi.z],
++                    if hostile(&m.kind.id) {
++                        0xFFFF_5555
++                    } else {
++                        0xFF55_FF88
++                    },
++                    2.0,
++                );
++            }
++            g.on_top.extend(boxes.lines);
++        }
++        if self.visual_tracers {
++            let direction = super::view_vector(view_yaw, view_pitch);
++            let start = std::array::from_fn(|a| camera[a] + direction[a] * 0.4);
++            let mut targets: Vec<([f64; 3], u32)> = game
++                .mobs
++                .iter()
++                .filter(|m| {
++                    m.alive() && hostile(&m.kind.id) && game.impact_remote_identity(m.id).is_none()
++                })
++                .map(|m| (m.center(), 0xFFFF_6666))
++                .collect();
++            targets.extend(
++                Self::players(game)
++                    .into_iter()
++                    .filter(|p| p.mob.alive() && !self.friends.contains_key(&p.uuid))
++                    .map(|p| (p.mob.center(), 0xFFFF_AA44)),
++            );
++            targets.retain(|(p, _)| {
++                let d: [f64; 3] = std::array::from_fn(|a| p[a] - camera[a]);
++                let forward: f64 = (0..3).map(|a| d[a] * direction[a]).sum();
++                forward > 0.01 && d.iter().map(|v| v * v).sum::<f64>() <= 128.0 * 128.0
++            });
++            targets.sort_by(|a, b| {
++                let d = |p: [f64; 3]| (0..3).map(|i| (p[i] - camera[i]).powi(2)).sum::<f64>();
++                d(a.0).total_cmp(&d(b.0))
++            });
++            for (end, color) in targets.into_iter().take(128) {
++                g.on_top.push(Line {
++                    start,
++                    end,
++                    color,
++                    width: 1.5,
++                });
++            }
++        }
++        g
++    }
++
++    /// Only reachable through an explicitly enabled test control socket; the
++    /// shipped launcher disables that socket for the whole session.
++    pub(super) fn test_status(&self, game: &Game<'_>) -> serde_json::Value {
++        let visuals = self.world_visuals(
++            game,
++            game.eye_position().unwrap_or([0.0; 3]),
++            game.yaw,
++            game.pitch,
++        );
++        serde_json::json!({
++            "ore": self.nearest_ore, "ore_results": self.ore_results,
++            "ore_radius":self.ore_radius,
++            "scan_remaining":self.scan.as_ref().map(|s|s.sections.len()-s.cursor).unwrap_or(0),
++            "aim_radius":self.aim_radius,"attack_delay":self.attack_delay,
++            "nav_goal":self.queued_nav, "nav_edge":self.nav_edge.is_some(),
++            "nav_pending":self.pending.as_ref().map(|p|format!("{:?}",p.kind)), "visual_arc":self.visual_arc,
++            "visual_ore":self.visual_ore,"visual_mob":self.visual_mob,
++            "visual_glow":self.visual_glow,"visual_xray":self.visual_xray,"aim_walls":self.aim_walls,
++            "xray_mask":self.xray_mask,"xray_rules":self.xray_rules,"tracers":self.visual_tracers,
++            "player_attack":self.player_attack,"player_bow":self.player_bow,"crits":self.crits,
++            "friends_count":self.friends.len(),"friends":self.friends.values().collect::<Vec<_>>(),
++            "friend_select":self.friends_selecting,"bridge_select":self.bridge_selecting,"bridge_first":self.bridge_first,
++            "bridge_next":self.bridge_build.as_ref().map(|b|b.next),"bridge_waiting":self.bridge_build.as_ref().map(|b|b.waiting),
++            "crit_pending":self.crit_pending.is_some(),"crit_strength":Self::crit_ready(game),
++            "world_line_count":visuals.lines.len(), "esp_line_count":visuals.on_top.len(),
++            "first_line_start":visuals.lines.first().map(|l|l.start),
++            "lead":self.last_lead.map(|i|serde_json::json!({"target":i.predicted_target,"ticks":i.flight_ticks,"yaw":i.yaw,"pitch":i.pitch})),
++        })
++    }
++    fn publish(&mut self, game: &mut Game<'_>, connected: bool) {
++        self.last_update = Some(Instant::now());
++        self.heartbeat = self.heartbeat.wrapping_add(1);
++        let dim = game.dim.id().to_owned();
++        let ore_pos = self.nearest_ore.unwrap_or([0, 0, 0]);
++        let ore_name = if self.nearest_ore.is_some() {
++            self.ore_type.as_str()
++        } else {
++            "none"
++        };
++        let mut nearby = Vec::new();
++        if let Some(p) = game.player.as_ref()
++            && self.radar
++        {
++            for m in game
++                .mobs
++                .iter()
++                .filter(|m| m.alive() && m.kind.id != "minecraft:player")
++            {
++                let dx = m.position.x - p.position.x;
++                let dy = m.position.y - p.position.y;
++                let dz = m.position.z - p.position.z;
++                let d = (dx * dx + dy * dy + dz * dz).sqrt();
++                if d <= 32.0 {
++                    nearby.push((d, m));
++                }
++            }
++        }
++        nearby.sort_by(|a, b| a.0.total_cmp(&b.0));
++        let closest = nearby.first().map(|(_, m)| *m);
++        let mob_name = closest
++            .map(|m| m.kind.id.strip_prefix("minecraft:").unwrap_or(&m.kind.id))
++            .unwrap_or("none");
++        let mob_pos = closest
++            .map(|m| {
++                [
++                    m.position.x.floor() as i32,
++                    m.position.y.floor() as i32,
++                    m.position.z.floor() as i32,
++                ]
++            })
++            .unwrap_or([0, 0, 0]);
++        let markers = nearby
++            .iter()
++            .take(32)
++            .map(|(_, m)| {
++                format!(
++                    "{:.2},{:.2},{}",
++                    m.position.x,
++                    m.position.z,
++                    bool_word(hostile(&m.kind.id))
++                )
++            })
++            .collect::<Vec<_>>()
++            .join(";");
++        let status = format!(
++            "v1|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
++            self.session,
++            self.heartbeat,
++            bool_word(connected),
++            bool_word(self.ore),
++            bool_word(self.attack),
++            bool_word(self.walk),
++            bool_word(self.radar),
++            ore_name,
++            dim,
++            ore_pos[0],
++            ore_pos[1],
++            ore_pos[2],
++            nearby.len().min(4096),
++            mob_name,
++            mob_pos[0],
++            mob_pos[1],
++            mob_pos[2]
++        );
++        let radar = format!("v1|{}|{}|0|{}", self.session, dim, markers);
++        let native = format!(
++            "v1|{}|{}|{}|{:.1}|{:.1}|{}|{}|{}|{}|{:.0}|{}|{}|{}|{}",
++            bool_word(self.aim),
++            bool_word(self.bow),
++            bool_word(self.mine),
++            self.attack_range,
++            self.attack_delay,
++            if self.all_mobs { "all" } else { "hostile" },
++            self.ore_type,
++            self.ore_radius,
++            bool_word(
++                self.queued_nav.is_some()
++                    || self
++                        .pending
++                        .as_ref()
++                        .is_some_and(|p| p.kind == TaskKind::Navigate)
++            ),
++            self.aim_radius,
++            bool_word(self.player_attack),
++            bool_word(self.player_bow),
++            bool_word(self.crits),
++            self.friends.len()
++        );
++        let _ = game
++            .mods
++            .mods
++            .impact_native_publish("bridge_status", status.into_bytes());
++        let _ = game
++            .mods
++            .mods
++            .impact_native_publish("bridge_radar", radar.into_bytes());
++        let _ = game
++            .mods
++            .mods
++            .impact_native_publish("native_status", native.into_bytes());
++    }
++    fn frame(&mut self, game: &mut Game<'_>, event_loop: &ActiveEventLoop) {
++        let installed = game.mods.mods.impact_native_running();
++        let generation = game.mods.mods.generation();
++        if self.mod_generation != Some(generation) {
++            if self.mod_generation.is_some() {
++                self.disable_active(game, event_loop);
++                self.ore = false;
++                self.radar = false;
++                self.invalidate_scan();
++                self.visual_arc = false;
++                self.visual_ore = false;
++                self.visual_mob = false;
++                self.visual_glow = false;
++                self.visual_tracers = false;
++                self.crits = false;
++                self.aim_walls = false;
++                self.set_xray(game, false);
++                self.last_bridge_seq = 0;
++                self.last_native_seq = 0;
++                self.last_update = None;
++            }
++            self.mod_generation = Some(generation);
++        }
++        let in_world = game.title.is_none() && game.player.is_some();
++        if installed && in_world && !self.friends_loaded {
++            self.load_friends(game);
++        }
++        self.drain_pending(game);
++        if !installed || !in_world {
++            self.disable_active(game, event_loop);
++            self.ore = false;
++            self.radar = false;
++            self.invalidate_scan();
++            self.visual_arc = false;
++            self.visual_ore = false;
++            self.visual_mob = false;
++            self.visual_glow = false;
++            self.visual_tracers = false;
++            self.crits = false;
++            self.aim_walls = false;
++            self.set_xray(game, false);
++            self.last_focus = false;
++            self.last_bridge_seq = 0;
++            self.last_native_seq = 0;
++            self.last_update = None;
++            return;
++        }
++        self.bridge_request(game, event_loop);
++        self.native_request(game, event_loop);
++        self.read_visual_state(game);
++        if !game.focused {
++            let had_active = self.attack
++                || self.walk
++                || self.aim
++                || self.bow
++                || self.mine
++                || self.player_attack
++                || self.player_bow
++                || self.friends_selecting
++                || self.bridge_selecting
++                || self.bridge_build.is_some()
++                || self.crit_pending.is_some()
++                || self.queued_nav.is_some()
++                || self.pending.is_some();
++            self.disable_active(game, event_loop);
++            if self.last_focus && had_active {
++                Self::say(game, "Active modules stopped: game window lost focus.");
++            }
++        }
++        self.last_focus = game.focused;
++        let playing = game.screen == Screen::Playing
++            && game.book.is_none()
++            && game.sign_edit.is_none()
++            && !game.dialog_open();
++        if !playing || !game.focused {
++            if self.crit_pending.is_some() {
++                self.cancel_critical(game);
++            }
++            if self.bridge_build.as_ref().is_some_and(|b| !b.waiting) {
++                self.cancel_own(game, event_loop);
++                self.bridge_build = None;
++                Self::say(
++                    game,
++                    "Мост отменён: экран изменился или окно потеряло фокус.",
++                );
++            }
++            if self.pending.is_some() || self.nav_edge.is_some() {
++                let nav = self.nav_edge.is_some()
++                    || self
++                        .pending
++                        .as_ref()
++                        .is_some_and(|p| matches!(p.kind, TaskKind::Navigate | TaskKind::NavEdit));
++                self.cancel_own(game, event_loop);
++                if nav {
++                    self.queued_nav = None;
++                    self.nav_started = false;
++                    Self::say(
++                        game,
++                        "Navigation cancelled when the screen changed or focus was lost.",
++                    );
++                }
++            }
++        }
++        if (!playing || !game.focused) && self.nav_started && self.pending.is_none() {
++            self.queued_nav = None;
++            self.nav_started = false;
++            Self::say(
++                game,
++                "Navigation cancelled when the screen changed or focus was lost.",
++            );
++        }
++        if self.ore || self.visual_ore {
++            self.scan_slice(game);
++        } else if self.scan.is_some() || !self.ore_results.is_empty() {
++            self.invalidate_scan();
++        }
++        if elapsed(self.last_update, Duration::from_millis(UPDATE_MILLIS)) {
++            self.publish(game, true);
++        }
++        if !playing || !game.focused || self.pending.is_some() {
++            return;
++        }
++        if self.nav_edge.is_some() {
++            self.advance_edge(game, event_loop);
++            return;
++        }
++        if self.queued_nav.is_some() {
++            let Some(player) = game.player.as_ref() else {
++                return;
++            };
++            if player.flying || player.fall_flying {
++                self.cancel_own(game, event_loop);
++                self.queued_nav = None;
++                self.nav_started = false;
++                Self::say(game, "Navigation stopped: disable flight first.");
++                return;
++            }
++            if !player.ground.on_ground {
++                let since = self.nav_airborne_since.get_or_insert_with(Instant::now);
++                if since.elapsed() < Duration::from_secs(2) {
++                    // A goto step may finish just before landing. Do not call
++                    // the planner from an airborne, non-grid position.
++                    return;
++                }
++                self.cancel_own(game, event_loop);
++                self.queued_nav = None;
++                self.nav_started = false;
++                Self::say(game, "Navigation stopped: player did not land.");
++                return;
++            }
++            self.nav_airborne_since = None;
++        }
++        if let Some((support, dx, dz)) = self.nav_retreat.take() {
++            let [x, y, z] = support;
++            let line = format!(
++                "goto {} {} {} --near 0.3 --strict-y --timeout 8",
++                f64::from(x) + 0.5 - 0.18 * f64::from(dx),
++                f64::from(y + 1),
++                f64::from(z) + 0.5 - 0.18 * f64::from(dz)
++            );
++            if let Err(e) = self.do_action(game, event_loop, line, TaskKind::Navigate) {
++                self.queued_nav = None;
++                self.nav_started = false;
++                self.bridge_build = None;
++                Self::say(game, format!("Navigation stopped before rising: {e}"));
++            }
++            return;
++        }
++        if self.bridge_centering.is_some() {
++            self.advance_bridge_center(game, event_loop);
++            return;
++        }
++        if self.bridge_build.is_some() {
++            self.advance_bridge(game, event_loop);
++            return;
++        }
++        if self.crit_pending.is_some() {
++            self.advance_critical(game);
++            return;
++        }
++        if let Some(goal) = self.queued_nav {
++            if Self::arrived(game, goal) {
++                self.queued_nav = None;
++                self.nav_started = false;
++                Self::say(game, "Navigation finished.");
++                return;
++            }
++            let Some(t) = Self::next_nav_segment(game, goal) else {
++                self.queued_nav = None;
++                self.nav_started = false;
++                Self::say(
++                    game,
++                    "Navigation stopped: no safe waypoint in loaded terrain.",
++                );
++                return;
++            };
++            self.nav_started = true;
++            let Some(p) = game.player.as_ref() else {
++                return;
++            };
++            let from = [
++                p.position.x.floor() as i32,
++                p.position.y.round() as i32,
++                p.position.z.floor() as i32,
++            ];
++            let result = if game.find_path(from, t, 0.8, true).is_some() {
++                let line = format!(
++                    "goto {} {} {} --near 0.8 --strict-y --timeout 60",
++                    t[0], t[1], t[2]
++                );
++                self.do_action(game, event_loop, line, TaskKind::Navigate)
++            } else if let Some(step) = Self::plan_edit(game, t) {
++                self.execute_edit(game, event_loop, step)
++            } else {
++                Err(
++                    "no safe local path; check loaded chunks, tools, building blocks and lava"
++                        .into(),
++                )
++            };
++            if let Err(e) = result {
++                self.cancel_own(game, event_loop);
++                self.queued_nav = None;
++                self.nav_started = false;
++                Self::say(game, format!("Navigation stopped: {e}"));
++            }
++            return;
++        }
++        let interval = if self.attack || self.player_attack {
++            self.attack_delay
++        } else if self.walk {
++            0.2
++        } else if self.mine {
++            1.5
++        } else {
++            0.025
++        };
++        if !elapsed(self.last_action, Duration::from_secs_f64(interval)) {
++            return;
++        }
++        self.last_action = Some(Instant::now());
++        if self.attack {
++            if let Some((id, center, _)) = self.nearest_mob(game, self.attack_range, false) {
++                if self.crits {
++                    let _ = self.begin_critical(game, id, false);
++                } else {
++                    self.attack_once(game, id, center);
++                }
++            }
++        } else if self.player_attack {
++            if let Some((id, center, _)) = self.nearest_player(game, self.attack_range, false) {
++                if self.crits {
++                    let _ = self.begin_critical(game, id, false);
++                } else {
++                    self.attack_once(game, id, center);
++                }
++            }
++        } else if self.walk {
++            let _ = self.do_action(game, event_loop, "move forward 0.2".into(), TaskKind::Walk);
++        } else if self.mine {
++            if let Some([x, y, z]) = self.nearest_ore
++                && let Some(p) = game.player.as_ref()
++            {
++                let d = ((f64::from(x) + 0.5 - p.position.x).powi(2)
++                    + (f64::from(y) + 0.5 - (p.position.y + 1.62)).powi(2)
++                    + (f64::from(z) + 0.5 - p.position.z).powi(2))
++                .sqrt();
++                // The incremental result may have changed since it was seen.
++                let state = game.world.block(x, y, z);
++                if !game.world.chunks.contains_key(&(x >> 4, z >> 4))
++                    || !ore_matches(&self.ore_type, &game.res.facts().get(state).name)
++                {
++                    self.invalidate_scan();
++                } else if d <= 4.5 {
++                    if let Err(e) = self.do_action(
++                        game,
++                        event_loop,
++                        format!("break {x} {y} {z} --timeout 20"),
++                        TaskKind::Mine,
++                    ) {
++                        self.mine = false;
++                        Self::say(game, format!("AutoMine stopped: {e}"));
++                    }
++                }
++            }
++        } else if self.aim {
++            if let Some((_, center, _)) = self.nearest_mob(game, self.aim_radius, self.aim_walls)
++                && let Some(eye) = game.eye_position()
++            {
++                let d = [center[0] - eye[0], center[1] - eye[1], center[2] - eye[2]];
++                let h = d[0].hypot(d[2]);
++                if h > 1e-6 {
++                    game.yaw = (-d[0]).atan2(d[2]).to_degrees() as f32;
++                    game.pitch = (-d[1]).atan2(h).to_degrees().clamp(-90.0, 90.0) as f32;
++                }
++            }
++        } else if (self.bow || self.player_bow)
++            && game.held().is_some_and(|s| &*s.item == "minecraft:bow")
++            && let Some((_, ticks)) = game.using
++        {
++            self.last_lead = None;
++            let candidate = if self.player_bow {
++                self.nearest_player(game, self.aim_radius, self.aim_walls)
++            } else {
++                self.nearest_mob(game, self.aim_radius, self.aim_walls)
++            };
++            if let Some((_, target, velocity)) = candidate
++                && let Some(eye) = game.eye_position()
++                && let Some(lead) = math::bow_intercept(
++                    [eye[0], eye[1] - 0.1, eye[2]],
++                    target,
++                    velocity,
++                    Self::shooter_velocity(game),
++                    math::bow_speed(ticks),
++                )
++            {
++                game.yaw = lead.yaw;
++                game.pitch = lead.pitch;
++                self.last_lead = Some(lead);
++            }
++        } else {
++            self.last_lead = None;
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn xray_overrides_are_bounded_and_unique() {
++        assert_eq!(xray_rules(""), Some(vec![]));
++        assert_eq!(
++            xray_rules("minecraft:stone=1"),
++            Some(vec![("minecraft:stone".to_owned(), true)])
++        );
++        assert!(xray_rules("minecraft:stone=1,minecraft:stone=0").is_none());
++        assert!(xray_rules("minecraft:stone=2").is_none());
++        assert!(xray_rules("../evil=1").is_none());
++        let too_many = (0..17)
++            .map(|i| format!("example:block{i}=1"))
++            .collect::<Vec<_>>()
++            .join(",");
++        assert!(xray_rules(&too_many).is_none());
++    }
++    #[test]
++    fn numeric_guards() {
++        assert!(number("NaN", 1.0, 3.5).is_none());
++        assert!(number("4", 1.0, 3.5).is_none());
++        assert_eq!(number("3", 1.0, 3.5), Some(3.0));
++        assert!(switch("yes").is_none());
++    }
++    #[test]
++    fn conservative_filters() {
++        assert!(hostile("minecraft:zombie"));
++        assert!(!hostile("minecraft:wolf"));
++        assert!(ore_matches("diamond", "minecraft:deepslate_diamond_ore"));
++        assert!(!ore_matches("diamond", "minecraft:stone"));
++    }
++}
+diff --git a/crates/horizon-client/src/game/impact_native_bridge.rs b/crates/horizon-client/src/game/impact_native_bridge.rs
+new file mode 100644
+index 0000000..fbae579
+--- /dev/null
++++ b/crates/horizon-client/src/game/impact_native_bridge.rs
+@@ -0,0 +1,75 @@
++//! A bounded, one-block-wide bridge centreline. The endpoints must be
++//! existing solid supporting blocks. Build from the lower end to the upper.
++pub(super) type Node = [i32; 3];
++pub(super) const MAX_BRIDGE_STEPS: i32 = 64;
++
++pub(super) fn bridge_line(mut a: Node, mut b: Node) -> Result<Vec<Node>, &'static str> {
++    if a[1] > b[1] {
++        std::mem::swap(&mut a, &mut b);
++    }
++    let dx = i64::from(b[0]) - i64::from(a[0]);
++    let dz = i64::from(b[2]) - i64::from(a[2]);
++    let dy = i64::from(b[1]) - i64::from(a[1]);
++    let (nx, nz) = (dx.abs(), dz.abs());
++    let total = nx + nz;
++    if total < 1 {
++        return Err("choose two different horizontal points");
++    }
++    if total > i64::from(MAX_BRIDGE_STEPS) {
++        return Err("bridge exceeds 64 horizontal steps");
++    }
++    if dy > total {
++        return Err("bridge is too steep: at most one block per step");
++    }
++    let mut result = Vec::with_capacity(total as usize + 1);
++    result.push(a);
++    let (mut x, mut z, mut ix, mut iz) = (a[0], a[2], 0i64, 0i64);
++    for step in 1..=total {
++        let go_x = ix < nx && (iz >= nz || (2 * ix + 1) * nz <= (2 * iz + 1) * nx);
++        if go_x {
++            x += dx.signum() as i32;
++            ix += 1;
++        } else {
++            z += dz.signum() as i32;
++            iz += 1;
++        }
++        let y = a[1] + (step * dy / total) as i32;
++        result.push([x, y, z]);
++    }
++    debug_assert_eq!(result.last(), Some(&b));
++    Ok(result)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn check(a: Node, b: Node) {
++        let path = bridge_line(a, b).unwrap();
++        let (lo, hi) = if a[1] <= b[1] { (a, b) } else { (b, a) };
++        assert_eq!(path.first(), Some(&lo));
++        assert_eq!(path.last(), Some(&hi));
++        for w in path.windows(2) {
++            let a = w[0];
++            let b = w[1];
++            assert_eq!((a[0] - b[0]).abs() + (a[2] - b[2]).abs(), 1);
++            assert!((0..=1).contains(&(b[1] - a[1])));
++        }
++    }
++    #[test]
++    fn straight_and_diagonal() {
++        check([0, 70, 0], [8, 70, 0]);
++        check([0, 70, 0], [-4, 70, 7]);
++    }
++    #[test]
++    fn climbs_and_reverse_selection() {
++        check([0, 70, 0], [5, 73, 3]);
++        check([5, 73, 3], [0, 70, 0]);
++    }
++    #[test]
++    fn bounds_and_steepness() {
++        assert!(bridge_line([0, 1, 0], [0, 4, 0]).is_err());
++        assert!(bridge_line([0, 1, 0], [1, 3, 0]).is_err());
++        assert!(bridge_line([0, 1, 0], [65, 1, 0]).is_err());
++        assert!(bridge_line([i32::MIN, 1, 0], [i32::MAX, 1, 0]).is_err());
++    }
++}
+diff --git a/crates/horizon-client/src/game/impact_native_math.rs b/crates/horizon-client/src/game/impact_native_math.rs
+new file mode 100644
+index 0000000..3a22c7d
+--- /dev/null
++++ b/crates/horizon-client/src/game/impact_native_math.rs
+@@ -0,0 +1,199 @@
++//! Small, deterministic helpers for Impact Native's scan and bow prediction.
++//! Projectile prediction deliberately assumes constant target velocity: it
++//! cannot know a server's future acceleration, random spread, or latency.
++
++pub(super) const ARROW_DRAG: f64 = 0.99_f32 as f64;
++pub(super) const ARROW_GRAVITY: f64 = 0.05;
++
++#[derive(Clone, Copy, Debug)]
++pub(super) struct Intercept {
++    pub yaw: f32,
++    pub pitch: f32,
++    pub flight_ticks: f64,
++    pub predicted_target: [f64; 3],
++}
++
++/// `BowItem.releaseUsing`: charge 20 ticks for a speed of 3 blocks/tick.
++pub(super) fn bow_speed(ticks: u32) -> f64 {
++    let f = f64::from(ticks) / 20.0;
++    ((f * f + 2.0 * f) / 3.0).clamp(0.0, 1.0) * 3.0
++}
++
++/// Integrated drag over a fractional number of ticks and its gravity drop.
++fn travel(ticks: f64) -> (f64, f64) {
++    let distance = (1.0 - ARROW_DRAG.powf(ticks)) / (1.0 - ARROW_DRAG);
++    let drop = ARROW_GRAVITY * (ticks - distance) / (1.0 - ARROW_DRAG);
++    (distance, drop)
++}
++
++/// A low-arc intercept, including projectile drag/gravity and inherited
++/// shooter motion. Each velocity is in blocks per *game tick*, not seconds.
++pub(super) fn bow_intercept(
++    origin: [f64; 3],
++    target: [f64; 3],
++    target_velocity: [f64; 3],
++    shooter_velocity: [f64; 3],
++    speed: f64,
++) -> Option<Intercept> {
++    if origin
++        .iter()
++        .chain(target.iter())
++        .chain(target_velocity.iter())
++        .chain(shooter_velocity.iter())
++        .any(|v| !v.is_finite())
++        || !speed.is_finite()
++        || !(0.3..=3.01).contains(&speed)
++    {
++        return None;
++    }
++    let separation = (0..3)
++        .map(|i| (target[i] - origin[i]).powi(2))
++        .sum::<f64>()
++        .sqrt();
++    if !(0.2..=160.0).contains(&separation) {
++        return None;
++    }
++    // A teleport/lag spike must not extrapolate thousands of blocks.
++    let target_velocity = target_velocity.map(|v| v.clamp(-1.0, 1.0));
++    let shooter_velocity = shooter_velocity.map(|v| v.clamp(-2.0, 2.0));
++    let needed = |ticks: f64| {
++        let (distance, drop) = travel(ticks);
++        let mut delta = std::array::from_fn::<_, 3, _>(|i| {
++            target[i] + target_velocity[i] * ticks - origin[i] - shooter_velocity[i] * distance
++        });
++        delta[1] += drop;
++        let magnitude = delta.iter().map(|v| v * v).sum::<f64>().sqrt();
++        (magnitude / distance - speed, delta)
++    };
++    let mut previous = 0.05;
++    for i in 1..=640 {
++        let t = f64::from(i) * 0.25;
++        if needed(t).0 <= 0.0 {
++            let (mut lo, mut hi) = (previous, t);
++            for _ in 0..30 {
++                let mid = (lo + hi) * 0.5;
++                if needed(mid).0 > 0.0 {
++                    lo = mid;
++                } else {
++                    hi = mid;
++                }
++            }
++            let d = needed(hi).1;
++            let horizontal = d[0].hypot(d[2]);
++            if horizontal < 1.0e-8 {
++                return None;
++            }
++            return Some(Intercept {
++                yaw: (-d[0]).atan2(d[2]).to_degrees() as f32,
++                pitch: (-d[1]).atan2(horizontal).to_degrees().clamp(-90.0, 90.0) as f32,
++                flight_ticks: hi,
++                predicted_target: std::array::from_fn(|i| target[i] + target_velocity[i] * hi),
++            });
++        }
++        previous = t;
++    }
++    None
++}
++
++/// One discrete arrow step after it moved; same order as AbstractArrow.
++pub(super) fn arrow_next_velocity(v: [f64; 3], water: bool) -> [f64; 3] {
++    let drag = if water { 0.6_f32 as f64 } else { ARROW_DRAG };
++    [v[0] * drag, v[1] * drag - ARROW_GRAVITY, v[2] * drag]
++}
++
++/// Start of the portion of a trajectory segment after the first `hidden`
++/// meters of path; None if the complete segment belongs to the hidden part.
++pub(super) fn trim_initial_path(
++    start: [f64; 3],
++    end: [f64; 3],
++    before: f64,
++    hidden: f64,
++) -> Option<[f64; 3]> {
++    let len = (0..3)
++        .map(|a| (end[a] - start[a]).powi(2))
++        .sum::<f64>()
++        .sqrt();
++    if !len.is_finite() || len < 1e-9 || before + len <= hidden {
++        return None;
++    }
++    let fraction = ((hidden - before) / len).clamp(0.0, 1.0);
++    Some(std::array::from_fn(|a| {
++        start[a] + (end[a] - start[a]) * fraction
++    }))
++}
++
++/// Squared distance from a point to a closed 16x16x16 section box.
++pub(super) fn section_distance2(eye: [f64; 3], base: [i32; 3]) -> f64 {
++    (0..3)
++        .map(|a| {
++            let low = f64::from(base[a]);
++            let high = low + 16.0;
++            let d = if eye[a] < low {
++                low - eye[a]
++            } else if eye[a] > high {
++                eye[a] - high
++            } else {
++                0.0
++            };
++            d * d
++        })
++        .sum()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn hides_two_actual_meters_including_partial_segments() {
++        assert_eq!(trim_initial_path([0.0; 3], [1.0, 0.0, 0.0], 0.0, 2.0), None);
++        assert_eq!(
++            trim_initial_path([1.0, 0.0, 0.0], [4.0, 0.0, 0.0], 1.0, 2.0),
++            Some([2.0, 0.0, 0.0])
++        );
++        assert_eq!(
++            trim_initial_path([4.0, 0.0, 0.0], [5.0, 0.0, 0.0], 4.0, 2.0),
++            Some([4.0, 0.0, 0.0])
++        );
++    }
++    #[test]
++    fn charge_uses_game_bow_power() {
++        assert_eq!(bow_speed(0), 0.0);
++        assert!((bow_speed(10) - 1.25).abs() < 1e-9);
++        assert_eq!(bow_speed(20), 3.0);
++        assert_eq!(bow_speed(80), 3.0);
++    }
++    #[test]
++    fn intercept_leads_a_crossing_target() {
++        let straight =
++            bow_intercept([0.0, 1.5, 0.0], [0.0, 1.5, 25.0], [0.0; 3], [0.0; 3], 3.0).unwrap();
++        let moving = bow_intercept(
++            [0.0, 1.5, 0.0],
++            [0.0, 1.5, 25.0],
++            [0.15, 0.0, 0.0],
++            [0.0; 3],
++            3.0,
++        )
++        .unwrap();
++        assert!(straight.yaw.abs() < 0.001 && straight.pitch < 0.0);
++        assert!(moving.yaw < -1.0, "{moving:?}");
++        assert!(moving.predicted_target[0] > 1.0 && moving.flight_ticks > 5.0);
++        let compensated = bow_intercept(
++            [0.0, 1.5, 0.0],
++            [0.0, 1.5, 25.0],
++            [0.15, 0.0, 0.0],
++            [0.15, 0.0, 0.0],
++            3.0,
++        )
++        .unwrap();
++        assert!(compensated.yaw.abs() < moving.yaw.abs());
++        assert!(bow_intercept([0.0; 3], [0.0; 3], [0.0; 3], [0.0; 3], 3.0).is_none());
++        assert!(bow_intercept([0.0; 3], [f64::NAN, 1.0, 10.0], [0.0; 3], [0.0; 3], 3.0).is_none());
++    }
++    #[test]
++    fn drag_and_section_bounds() {
++        let v = arrow_next_velocity([1.0, 0.0, 0.0], false);
++        assert!((v[0] - ARROW_DRAG).abs() < 1e-9 && (v[1] + 0.05).abs() < 1e-9);
++        assert_eq!(section_distance2([1.0, 1.0, 1.0], [0, 0, 0]), 0.0);
++        assert_eq!(section_distance2([20.0, 1.0, 1.0], [0, 0, 0]), 16.0);
++    }
++}
+diff --git a/crates/horizon-client/src/game/impact_native_nav.rs b/crates/horizon-client/src/game/impact_native_nav.rs
+new file mode 100644
+index 0000000..0827299
+--- /dev/null
++++ b/crates/horizon-client/src/game/impact_native_nav.rs
+@@ -0,0 +1,253 @@
++//! Bounded, conservative block-edit path planner. It plans a single local
++//! action at a time and rechecks the real, loaded world after each action.
++//! This is not Baritone; the executor may stop when a face is not reachable.
++use std::{
++    cmp::Reverse,
++    collections::{BinaryHeap, HashMap},
++};
++
++pub(super) type Node = [i32; 3];
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum Cell {
++    Empty,
++    Solid { breakable: bool },
++    Blocked,
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum Step {
++    Walk(Node),
++    Break(Node),
++    Place(Node, bool),
++}
++
++/// Try a cardinal neighbour at equal height, one above, or one below.
++/// At most two full scaffold blocks support a step up. A descent must land on
++/// an existing full block: no digging straight under the player's feet.
++fn transition<F, S>(
++    from: Node,
++    to: Node,
++    can_place: bool,
++    cell: &F,
++    safe: &S,
++) -> Option<(Step, u32)>
++where
++    F: Fn(Node) -> Cell,
++    S: Fn(Node) -> bool,
++{
++    let dy = to[1] - from[1];
++    if !safe(to) || !(-1..=1).contains(&dy) {
++        return None;
++    }
++    if dy > 0 && cell([from[0], from[1] + 2, from[2]]) != Cell::Empty {
++        return None;
++    }
++    let mut breaks = Vec::new();
++    // A descending step also needs the top of the entry column clear.
++    let high = if dy < 0 { from[1] + 1 } else { to[1] + 1 };
++    for y in (to[1]..=high).rev() {
++        let pos = [to[0], y, to[2]];
++        match cell(pos) {
++            Cell::Empty => {}
++            Cell::Solid { breakable: true } if safe(pos) => breaks.push(pos),
++            _ => return None,
++        }
++    }
++    let below = [to[0], to[1] - 1, to[2]];
++    let mut places = Vec::new();
++    match cell(below) {
++        Cell::Solid { .. } => {}
++        Cell::Empty if can_place && dy >= 0 && safe(below) => {
++            if dy > 0 {
++                let lower = [to[0], to[1] - 2, to[2]];
++                match cell(lower) {
++                    Cell::Solid { .. } => {}
++                    Cell::Empty if safe(lower) => places.push(lower),
++                    _ => return None,
++                }
++            }
++            places.push(below);
++        }
++        _ => return None,
++    }
++    let cost = 10 + u32::from(dy != 0) * 7 + 45 * breaks.len() as u32 + 55 * places.len() as u32;
++    let first = breaks
++        .first()
++        .copied()
++        .map(Step::Break)
++        .or_else(|| places.first().copied().map(|p| Step::Place(p, dy > 0)))
++        .unwrap_or(Step::Walk(to));
++    Some((first, cost))
++}
++
++/// A* with a hard expansion cap, never a blind movement fallback. The game
++/// validates each action and replans immediately after it has been confirmed.
++pub(super) fn plan<F, S>(
++    from: Node,
++    goal: [f64; 3],
++    can_place: bool,
++    cell: F,
++    safe: S,
++) -> Option<Step>
++where
++    F: Fn(Node) -> Cell,
++    S: Fn(Node) -> bool,
++{
++    if !safe(from) {
++        return None;
++    }
++    let reached = |n: Node| {
++        (f64::from(n[0]) + 0.5 - goal[0]).hypot(f64::from(n[2]) + 0.5 - goal[2]) <= 0.8
++            && (f64::from(n[1]) - goal[1]).abs() <= 0.8
++    };
++    let h = |n: Node| -> u32 {
++        ((f64::from(n[0]) + 0.5 - goal[0]).abs()
++            + (f64::from(n[1]) - goal[1]).abs()
++            + (f64::from(n[2]) + 0.5 - goal[2]).abs())
++        .max(0.0)
++        .min(10_000.0) as u32
++            * 10
++    };
++    let mut open = BinaryHeap::new();
++    let mut cost = HashMap::new();
++    let mut came: HashMap<Node, (Node, Step)> = HashMap::new();
++    cost.insert(from, 0u32);
++    open.push(Reverse((h(from), from)));
++    let mut expanded = 0;
++    while let Some(Reverse((_, n))) = open.pop() {
++        if n != from && reached(n) {
++            let mut at = n;
++            while let Some(&(previous, action)) = came.get(&at) {
++                if previous == from {
++                    return Some(action);
++                }
++                at = previous;
++            }
++            return None;
++        }
++        expanded += 1;
++        if expanded > 8_000 {
++            return None;
++        }
++        let base = cost[&n];
++        for [dx, dz] in [[1, 0], [-1, 0], [0, 1], [0, -1]] {
++            for dy in [0, 1, -1] {
++                let to = [n[0] + dx, n[1] + dy, n[2] + dz];
++                // Bounded local problem; the outer navigator supplies segments.
++                if (to[0] - from[0]).abs() > 32
++                    || (to[2] - from[2]).abs() > 32
++                    || (to[1] - from[1]).abs() > 12
++                {
++                    continue;
++                }
++                let Some((action, step_cost)) = transition(n, to, can_place, &cell, &safe) else {
++                    continue;
++                };
++                let next = base.saturating_add(step_cost);
++                if cost.get(&to).is_none_or(|old| next < *old) {
++                    cost.insert(to, next);
++                    came.insert(to, (n, action));
++                    open.push(Reverse((next.saturating_add(h(to)), to)));
++                }
++            }
++        }
++    }
++    None
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn bridge_is_a_placement_and_never_a_blind_walk() {
++        let cell = |p: Node| {
++            if p[1] == 0 && p[0] == 0 && p[2] == 0 {
++                Cell::Solid { breakable: false }
++            } else {
++                Cell::Empty
++            }
++        };
++        assert_eq!(
++            plan([0, 1, 0], [2.5, 1.0, 0.5], true, cell, |_| true),
++            Some(Step::Place([1, 0, 0], false))
++        );
++        assert_eq!(
++            plan([0, 1, 0], [2.5, 1.0, 0.5], false, cell, |_| true),
++            None
++        );
++    }
++    #[test]
++    fn rises_using_two_scaffold_blocks_and_rejects_hazards() {
++        let cell = |p: Node| {
++            if p == [0, 0, 0] {
++                Cell::Solid { breakable: false }
++            } else {
++                Cell::Empty
++            }
++        };
++        assert_eq!(
++            plan([0, 1, 0], [1.5, 2.0, 0.5], true, cell, |p| p[2] == 0),
++            Some(Step::Place([1, 0, 0], true))
++        );
++        assert_eq!(
++            plan([0, 1, 0], [1.5, 2.0, 0.5], true, cell, |p| p[0] == 0),
++            None
++        );
++    }
++    #[test]
++    fn repeated_replanning_finishes_bridge_and_staircase() {
++        use std::collections::HashMap;
++        fn simulate(goal: [f64; 3]) {
++            let mut cells = HashMap::from([([0, 0, 0], Cell::Solid { breakable: false })]);
++            let mut from = [0, 1, 0];
++            for _ in 0..20 {
++                if (f64::from(from[0]) + 0.5 - goal[0]).hypot(f64::from(from[2]) + 0.5 - goal[2])
++                    <= 0.8
++                    && (f64::from(from[1]) - goal[1]).abs() <= 0.8
++                {
++                    return;
++                }
++                let action = plan(
++                    from,
++                    goal,
++                    true,
++                    |p| *cells.get(&p).unwrap_or(&Cell::Empty),
++                    |_| true,
++                )
++                .unwrap();
++                match action {
++                    Step::Place(p, _) => {
++                        cells.insert(p, Cell::Solid { breakable: true });
++                    }
++                    Step::Break(p) => {
++                        cells.remove(&p);
++                    }
++                    Step::Walk(p) => {
++                        from = p;
++                    }
++                }
++            }
++            panic!("no progress to {goal:?}; at {from:?}");
++        }
++        simulate([3.5, 1.0, 0.5]);
++        simulate([1.5, 2.0, 0.5]);
++    }
++    #[test]
++    fn descending_digs_adjacent_column_not_own_floor() {
++        let cell = |p: Node| {
++            if p[2] != 0 {
++                return Cell::Blocked;
++            }
++            if p[1] <= 0 {
++                Cell::Solid {
++                    breakable: p[1] == 0 && p[0] > 0,
++                }
++            } else {
++                Cell::Empty
++            }
++        };
++        assert_eq!(
++            plan([0, 1, 0], [1.5, 0.0, 0.5], false, cell, |_| true),
++            Some(Step::Break([1, 0, 0]))
++        );
++    }
++}
+diff --git a/crates/horizon-client/src/game/item_draw.rs b/crates/horizon-client/src/game/item_draw.rs
+index 354e837..0d50d2c 100644
+--- a/crates/horizon-client/src/game/item_draw.rs
++++ b/crates/horizon-client/src/game/item_draw.rs
+@@ -445,7 +445,7 @@ impl Game<'_> {
+             ) {
+                 self.submit_item_world(&state, copy, vertex_light(packed), out);
+             }
+-            if self.entity_glowing(item.id) {
++            if self.entity_glowing(item.id) || self.impact_entity_glow() {
+                 let rgb = super::glowing::team_color(self.mob_team(item.id));
+                 self.mark_outline(&out[entity_start..], rgb);
+             } else {
+diff --git a/crates/horizon-client/src/game/mods.rs b/crates/horizon-client/src/game/mods.rs
+index 52dc46f..5de5e9c 100644
+--- a/crates/horizon-client/src/game/mods.rs
++++ b/crates/horizon-client/src/game/mods.rs
+@@ -306,6 +306,7 @@ impl Game<'_> {
+         let on = |id: &str| enabled.contains(id) || dev_ids.iter().any(|d| d == id);
+         let mods = Mods::load_for(self.mod_runs(), &paths, on, vanilla_command);
+         self.mods.mods = mods;
++        self.trust_impact_native();
+         let chosen = &self.settings.mods;
+         self.mods.mods.set_bindings(|id| chosen.keys_of(id));
+         // Entries were replaced wholesale: a screen's owner index is stale.
+@@ -316,6 +317,23 @@ impl Game<'_> {
+         self.sync_mod_commands();
+         self.show_mod_output();
+     }
++    /// Only the exact --dev-mod path beside this executable is allowed to
++    /// use the native in-process channel. Another mod cannot gain authority
++    /// merely by claiming the same manifest id.
++    fn trust_impact_native(&mut self) {
++        let Some(sibling) = std::env::current_exe()
++            .ok()
++            .and_then(|p| p.parent().map(|d| d.join("impact_horizon_native.hmod")))
++            .and_then(|p| std::fs::canonicalize(p).ok())
++        else {
++            return;
++        };
++        for path in &self.mods.dev {
++            if std::fs::canonicalize(path).ok().as_ref() == Some(&sibling) {
++                self.mods.mods.impact_native_trust(path);
++            }
++        }
++    }
+     /// Which mods this game runs: a server the server mods, the window
+     /// client mods, and both when it simulates the world itself (in-frame).
+     fn mod_runs(&self) -> Runs {
+@@ -613,6 +631,7 @@ impl Game<'_> {
+         }
+         self.mods.checked = Some(Instant::now());
+         if self.mods.mods.reload_changed(vanilla_command) {
++            self.trust_impact_native();
+             let chosen = &self.settings.mods;
+             self.mods.mods.set_bindings(|id| chosen.keys_of(id));
+             self.list_mods();
+@@ -904,6 +923,18 @@ impl Game<'_> {
+     /// A mod pushes its screen (`ui.open-screen`), or Options > Mods opens
+     /// its settings page (`settings`, the mod's `installed` index).
+     pub(super) fn open_mod_screen(&mut self, owner: usize, settings: bool) {
++        // Replacing the already-open trusted screen must not reset scrolling
++        // or stack screens every time the module updates a button label.
++        if !settings
++            && self.mods.mods.impact_native_owner(owner)
++            && self
++                .mods
++                .screen
++                .as_ref()
++                .is_some_and(|s| !s.settings && s.owner == owner)
++        {
++            return;
++        }
+         if self.title.is_some() {
+             return;
+         }
+@@ -950,6 +981,15 @@ impl Game<'_> {
+     /// The mod's screen or settings page: its title over widgets stacked
+     /// down the middle, a Done button, Esc to leave (vanilla's menus).
+     pub(super) fn draw_mod_screen(&mut self, batch: &mut HudBatch) {
++        if self
++            .mods
++            .screen
++            .as_ref()
++            .is_some_and(|s| self.mods.mods.impact_native_owner(s.owner))
++        {
++            self.draw_impact_screen(batch);
++            return;
++        }
+         let Some(ms) = self.mods.screen.as_mut() else {
+             // The screen was dropped while it was up: back to the world,
+             // mouse held again like any return to Playing.
+@@ -1133,6 +1173,15 @@ impl Game<'_> {
+             self.bind_mod_key(keybinds::mouse_name(button));
+             return;
+         }
++        if self
++            .mods
++            .screen
++            .as_ref()
++            .is_some_and(|s| self.mods.mods.impact_native_owner(s.owner))
++        {
++            self.impact_screen_click(button);
++            return;
++        }
+         if button != MouseButton::Left {
+             return;
+         }
+@@ -1199,8 +1248,156 @@ impl Game<'_> {
+             self.show_mod_output();
+         }
+     }
++    /// Five categorized columns on one surface. Other mods retain vanilla layout.
++    fn draw_impact_screen(&mut self, batch: &mut HudBatch) {
++        let Some(ms) = self.mods.screen.as_ref() else {
++            return;
++        };
++        let Some((title, widgets)) = Self::mod_ui_view(&self.mods.mods, ms) else {
++            return;
++        };
++        let atlas = &self.gui.atlas;
++        ui::menu_background(
++            batch,
++            atlas,
++            0.0,
++            0.0,
++            batch.width,
++            batch.height,
++            self.player.is_some(),
++        );
++        let positions = impact_layout(
++            batch.width,
++            batch.height,
++            widgets,
++            ms.scrolls.first().map_or(0.0, |s| s.amount),
++        );
++        let mut hint = if ms.binding.is_some() {
++            "Press a key; Esc unbinds".to_string()
++        } else {
++            format!("{title} | RMB: bind  Wheel: scroll")
++        };
++        for (widget, pos) in widgets.iter().zip(positions) {
++            let Some((x, y, w, h)) = pos else {
++                continue;
++            };
++            match widget {
++                UiWidget::Text(t) => {
++                    ui::centered_text(batch, atlas, &Text::literal(&t.text), x, y, w, 0xFF66_CCFF)
++                }
++                UiWidget::Button(b) => {
++                    let hovered = ui::hovered(self.cursor, x, y, w, h);
++                    impact_button(batch, atlas, x, y, w, h, &b.label, hovered);
++                    if hovered
++                        && ms.binding.is_none()
++                        && let Some(name) = impact_hotkey(b.id)
++                        && let Some(key) = self
++                            .mods
++                            .mods
++                            .keys_of(ms.owner)
++                            .iter()
++                            .find(|k| k.name == name)
++                    {
++                        hint = format!(
++                            "RMB to bind {}: {}",
++                            key.label,
++                            keybinds::display_name(&key.key).plain()
++                        );
++                    }
++                }
++                _ => {}
++            }
++        }
++        ui::centered_text(
++            batch,
++            atlas,
++            &Text::literal(hint),
++            0.0,
++            12.0,
++            batch.width,
++            u32::MAX,
++        );
++        let cx = (batch.width / 2.0).floor();
++        ui::button(
++            batch,
++            atlas,
++            cx - 100.0,
++            batch.height - 27.0,
++            200.0,
++            20.0,
++            &Text::literal("Done"),
++            true,
++            ui::hovered(self.cursor, cx - 100.0, batch.height - 27.0, 200.0, 20.0),
++        );
++    }
++    fn impact_screen_click(&mut self, button: MouseButton) {
++        let (width, height) = self.gui_size();
++        let cursor = self.cursor;
++        if button == MouseButton::Left
++            && ui::hovered(
++                cursor,
++                (width / 2.0).floor() - 100.0,
++                height - 27.0,
++                200.0,
++                20.0,
++            )
++        {
++            self.audio.play_button_click();
++            self.close_mod_screen(true);
++            return;
++        }
++        let Some(ms) = self.mods.screen.as_ref() else {
++            return;
++        };
++        let Some((_, widgets)) = Self::mod_ui_view(&self.mods.mods, ms) else {
++            return;
++        };
++        let layout = impact_layout(
++            width,
++            height,
++            widgets,
++            ms.scrolls.first().map_or(0.0, |s| s.amount),
++        );
++        let id = widgets.iter().zip(layout).find_map(|(widget, pos)| {
++            let UiWidget::Button(b) = widget else {
++                return None;
++            };
++            let (x, y, w, h) = pos?;
++            ui::hovered(cursor, x, y, w, h).then_some(b.id)
++        });
++        let Some(id) = id else {
++            return;
++        };
++        if button == MouseButton::Right {
++            if let Some(name) = impact_hotkey(id) {
++                self.audio.play_button_click();
++                if let Some(ms) = self.mods.screen.as_mut() {
++                    ms.binding = Some(name.to_string());
++                }
++            }
++        } else if button == MouseButton::Left {
++            let owner = ms.owner;
++            self.audio.play_button_click();
++            self.mods.mods.ui_select(owner, id, 0);
++            self.show_mod_output();
++        }
++    }
++
+     /// The wheel over a `list` scrolls it.
+     pub(super) fn mod_screen_scroll(&mut self, delta: f32) {
++        if self
++            .mods
++            .screen
++            .as_ref()
++            .is_some_and(|s| self.mods.mods.impact_native_owner(s.owner))
++        {
++            let (_, h) = self.gui_size();
++            if let Some(ms) = self.mods.screen.as_mut() {
++                ms.scrolls.resize_with(1, ui::Scroll::default);
++                ms.scrolls[0].wheel(delta, IMPACT_ROW, IMPACT_TOP, h - 32.0, IMPACT_CONTENT);
++            }
++            return;
++        }
+         let (w, h) = self.gui_size();
+         let cursor = self.cursor;
+         let Some(ms) = self.mods.screen.as_mut() else {
+@@ -1235,3 +1432,88 @@ const MOD_UI_COLUMN: f32 = 200.0;
+ /// A key row's height with its gap, as the widgets below it space out.
+ #[cfg(feature = "mods")]
+ const MOD_UI_KEY_ROW: f32 = 26.0;
++
++#[cfg(feature = "mods")]
++const IMPACT_TOP: f32 = 32.0;
++#[cfg(feature = "mods")]
++const IMPACT_ROW: f32 = 19.0;
++#[cfg(feature = "mods")]
++const IMPACT_CONTENT: f32 = 12.0 + 21.0 * IMPACT_ROW;
++#[cfg(feature = "mods")]
++fn impact_hotkey(id: u32) -> Option<&'static str> {
++    Some(match id {
++        54 => "ih_attack",
++        74 => "ih_aim",
++        75 => "ih_bow",
++        80 => "ih_walls",
++        53 => "ih_ore",
++        73 => "ih_mine",
++        55 => "ih_walk",
++        56 => "ih_radar",
++        64 => "ih_arc",
++        66 => "ih_oreesp",
++        67 => "ih_mobesp",
++        81 => "ih_glow",
++        82 => "ih_xray",
++        57 => "ih_stop",
++        18 => "impact_zoom",
++        85 => "impact_menu",
++        86 => "ih_pattack",
++        87 => "ih_pbow",
++        88 => "ih_crits",
++        89 => "ih_friends",
++        91 => "ih_bridge",
++        92 => "ih_tracers",
++        _ => return None,
++    })
++}
++#[cfg(feature = "mods")]
++fn impact_button(
++    batch: &mut HudBatch, atlas: &horizon_client::hud::HudAtlas,
++    x: f32, y: f32, w: f32, h: f32, label: &str, hovered: bool,
++) {
++    horizon_client::widgets::record(label, [x,y,w,h], true);
++    horizon_client::widgets::widget_cursor(hovered, true);
++    let sprite = if hovered { "gui/sprites/widget/button_highlighted" } else { "gui/sprites/widget/button" };
++    ui::nine_slice(batch, atlas, sprite, x, y, w, h, u32::MAX);
++    let text=Text::literal(label);
++    let width=atlas.font.width_text(&text.resolved());
++    let scale=if width > 0.0 { ((w-6.0).max(1.0)/width).min(1.0) } else { 1.0 };
++    ui::text_scaled(batch,atlas,&text,x+((w-width*scale)/2.0).max(0.0),
++        y+(h-8.0*scale)/2.0,scale,u32::MAX);
++}
++#[cfg(feature = "mods")]
++fn impact_layout(
++    width: f32,
++    height: f32,
++    widgets: &[UiWidget],
++    scroll: f32,
++) -> Vec<Option<(f32, f32, f32, f32)>> {
++    let available = (width - 20.0).max(50.0);
++    let step = available / 5.0;
++    let column = (step - 4.0).max(6.0);
++    let mut col = -1i32;
++    let mut row = 0usize;
++    widgets
++        .iter()
++        .map(|widget| {
++            let (y, h) = match widget {
++                UiWidget::Text(_) => {
++                    col += 1;
++                    row = 0;
++                    (IMPACT_TOP - scroll, 10.0)
++                }
++                UiWidget::Button(_) => {
++                    let y = IMPACT_TOP + 12.0 + row as f32 * IMPACT_ROW - scroll;
++                    row += 1;
++                    (y, 17.0)
++                }
++                _ => return None,
++            };
++            if !(0..5).contains(&col) || y < IMPACT_TOP || y + h > height - 32.0 {
++                return None;
++            }
++            Some((10.0 + col as f32 * step, y, column, h))
++        })
++        .collect()
++}
+diff --git a/crates/horizon-client/src/game/remote.rs b/crates/horizon-client/src/game/remote.rs
+index 0e2d942..d3dccff 100644
+--- a/crates/horizon-client/src/game/remote.rs
++++ b/crates/horizon-client/src/game/remote.rs
+@@ -5239,7 +5239,30 @@ impl Game<'_> {
+         }
+     }
+ 
++    /// UUID mapping is authoritative for identifying player entities; names
++    /// can temporarily be absent from a server's player-info list.
++    #[cfg(feature = "mods")]
++    pub(super) fn impact_remote_identity(&self, id: u32) -> Option<(u128, String)> {
++        let r=self.remote.as_ref()?;
++        let uuid=*r.level_players.get(&(id as i32))?;
++        Some((uuid, r.players.get(&uuid).cloned().unwrap_or_default()))
++    }
++    /// Beginning friend selection cancels pending click events rather than
++    /// releasing them at the next network tick as an unintended attack.
++    #[cfg(feature = "mods")]
++    pub(super) fn impact_clear_queued_attack(&mut self) {
++        self.attack_clicks=0;
++        self.toggles.0[2].reset();
++        self.left=false;
++        if let Some(r)=self.remote.as_mut() {
++            r.input=Default::default();
++            r.stop_mining=true;
++        }
++    }
++
+     fn remote_start_attack(&mut self) -> bool {
++        #[cfg(feature = "mods")]
++        if self.impact_protect_attack() { return false; }
+         if self.clicks.miss_time > 0 {
+             return false;
+         }
+diff --git a/crates/horizon-client/src/mesher.rs b/crates/horizon-client/src/mesher.rs
+index 491e703..09c84c8 100644
+--- a/crates/horizon-client/src/mesher.rs
++++ b/crates/horizon-client/src/mesher.rs
+@@ -270,9 +270,34 @@ enum Tint {
+     Redstone(u8),
+     Stem(u8),
+ }
++/// X-Ray categories controlled by the Impact-style menu. A zero category is
++/// normally hidden; an individual block rule can override any state.
++pub const XRAY_ALL: u32 = (1 << 13) - 1;
++pub fn xray_category(name: &str) -> u32 {
++    let name = name.strip_prefix("minecraft:").unwrap_or(name);
++    match name {
++        "diamond_ore" | "deepslate_diamond_ore" => 1 << 0,
++        "iron_ore" | "deepslate_iron_ore" => 1 << 1,
++        "gold_ore" | "deepslate_gold_ore" | "nether_gold_ore" => 1 << 2,
++        "redstone_ore" | "deepslate_redstone_ore" => 1 << 3,
++        "emerald_ore" | "deepslate_emerald_ore" => 1 << 4,
++        "coal_ore" | "deepslate_coal_ore" => 1 << 5,
++        "copper_ore" | "deepslate_copper_ore" => 1 << 6,
++        "lapis_ore" | "deepslate_lapis_ore" => 1 << 7,
++        "nether_quartz_ore" => 1 << 8,
++        "ancient_debris" => 1 << 9,
++        "water" => 1 << 10,
++        "lava" => 1 << 11,
++        name if name.ends_with("_ore") => 1 << 12,
++        _ => 0,
++    }
++}
++
+ /// Per-state data the mesher needs on every block, flattened for speed.
+ #[derive(Clone, Copy)]
+ struct Info {
++    /// Retained in the optional client-side X-Ray terrain mesh.
++    xray_category: u32,
+     /// `isSolidRender`.
+     solid: bool,
+     /// `isCollisionShapeFullBlock`: AO faces flush with a full block sample outside it.
+@@ -445,6 +470,7 @@ impl MeshTables {
+                     .or_insert_with(|| fluid::coverage(shape, d));
+             }
+             info.push(Info {
++                xray_category: xray_category(name),
+                 solid: s.solid_render,
+                 full: s.full_collision,
+                 permeable: !s.solid_render || s.dampening == 0,
+@@ -719,6 +745,11 @@ pub struct Mesher<'a> {
+     pub smooth_lighting: bool,
+     /// The `cutoutLeaves` option (fancy graphics); off makes leaves opaque.
+     pub cutout_leaves: bool,
++    /// Client-only visibility filter, never alters a saved or server block.
++    pub xray: bool,
++    pub xray_mask: u32,
++    /// State-indexed overrides: -1 category, 0 hidden, 1 shown.
++    pub xray_states: Arc<Vec<i8>>,
+ }
+ impl Mesher<'_> {
+     /// `region[dz][dx]` are the chunks around the meshed column (centre 1,1).
+@@ -729,7 +760,22 @@ impl Mesher<'_> {
+         if section.is_uniform(0) {
+             return out;
+         }
+-        let pad = Padded::new(region, sy);
++        let mut pad = Padded::new(region, sy);
++        if self.xray {
++            // Filter *both* the center and border: hidden blocks cannot occlude
++            // the newly exposed ore faces. Never touch the real chunks.
++            for id in &mut pad.blocks {
++                let visible = match self.xray_states.get(*id as usize).copied().unwrap_or(-1) {
++                    0 => false,
++                    1 => true,
++                    _ => self.tables.info.get(*id as usize)
++                        .is_some_and(|i| i.xray_category & self.xray_mask != 0),
++                };
++                if !visible { *id = 0; }
++            }
++            // Underground ores must remain recognizable without a light source.
++            pad.light.fill(0xFF);
++        }
+         out.visibility = visibility(&pad, &self.tables.info);
+         let base_y = MIN_Y + sy * 16;
+         let mut tints = Tints::new(
+diff --git a/crates/horizon-client/src/streaming.rs b/crates/horizon-client/src/streaming.rs
+index 6588ac3..a419f8e 100644
+--- a/crates/horizon-client/src/streaming.rs
++++ b/crates/horizon-client/src/streaming.rs
+@@ -151,13 +151,16 @@ impl<G: ChunkGenerator> Saves for G {
+     }
+ }
+ /// Per-job mesher inputs that change with the dimension or the options.
+-#[derive(Clone, Copy)]
++#[derive(Clone)]
+ struct MeshSettings {
+     nether: bool,
+     zoom: BiomeZoom,
+     blend_radius: i32,
+     smooth_lighting: bool,
+     cutout_leaves: bool,
++    xray: bool,
++    xray_mask: u32,
++    xray_states: Arc<Vec<i8>>,
+ }
+ enum Job {
+     Generate(i32, i32),
+@@ -271,6 +274,9 @@ pub struct Streaming {
+     /// The `ao` and `cutoutLeaves` options.
+     pub smooth_lighting: bool,
+     pub cutout_leaves: bool,
++    pub xray: bool,
++    pub xray_mask: u32,
++    pub xray_states: Arc<Vec<i8>>,
+     /// Incremental relighting of block edits on lit chunks (see `light::relight`).
+     light_tables: Arc<LightTables>,
+     /// Applied edits by sequence, replayed onto light jobs snapshotted before them.
+@@ -525,6 +531,9 @@ impl Streaming {
+                                         blend_radius: settings.blend_radius,
+                                         smooth_lighting: settings.smooth_lighting,
+                                         cutout_leaves: settings.cutout_leaves,
++                                        xray: settings.xray,
++                                        xray_mask: settings.xray_mask,
++                                        xray_states: settings.xray_states.clone(),
+                                         assets: &context.assets,
+                                         render: &context.render,
+                                         tables: &context.tables,
+@@ -587,6 +596,9 @@ impl Streaming {
+             biome_blend: 2,
+             smooth_lighting: true,
+             cutout_leaves: true,
++            xray: false,
++            xray_mask: crate::mesher::XRAY_ALL,
++            xray_states: Arc::new(Vec::new()),
+             light_tables,
+             light_log: Vec::new(),
+             light_edit_sequence: 0,
+@@ -619,6 +631,30 @@ impl Streaming {
+             }
+         }
+     }
++    /// Change the terrain filter and invalidate every old, queued/in-flight
++    /// mesh. Lighting and the actual blocks remain exactly as the server sent.
++    pub fn set_xray(&mut self, world: &mut World, on: bool, mask: u32, states: Arc<Vec<i8>>) -> bool {
++        if self.xray == on && self.xray_mask == mask && self.xray_states == states {
++            return false;
++        }
++        self.xray = on;
++        self.xray_mask = mask;
++        self.xray_states = states;
++        self.meshing.clear();
++        self.shared
++            .queue
++            .lock()
++            .unwrap()
++            .retain(|q| !matches!(q.job, Job::Mesh(..)));
++        for &(x, z) in world.chunks.keys() {
++            if self.lit.contains(&(x, z)) {
++                for sy in 0..SECTIONS as i32 {
++                    world.dirty_sections.insert((x, sy, z));
++                }
++            }
++        }
++        true
++    }
+     /// A column received from a server, with the light it sent
+     /// (`ClientPacketListener.handleLevelChunkWithLight`): nothing is
+     /// relit, and it and its neighbours remesh (`enableChunkLight`).
+@@ -1268,6 +1304,9 @@ impl Streaming {
+                             blend_radius: self.biome_blend,
+                             smooth_lighting: self.smooth_lighting,
+                             cutout_leaves: self.cutout_leaves,
++                            xray: self.xray,
++                            xray_mask: self.xray_mask,
++                            xray_states: self.xray_states.clone(),
+                         },
+                     ),
+                 );
+diff --git a/crates/horizon-client/tests/streaming_meshes.rs b/crates/horizon-client/tests/streaming_meshes.rs
+index 49b9040..abbff94 100644
+--- a/crates/horizon-client/tests/streaming_meshes.rs
++++ b/crates/horizon-client/tests/streaming_meshes.rs
+@@ -215,6 +215,9 @@ fn relit_columns_keep_every_mesh_current() {
+             blend_radius: 2,
+             smooth_lighting: true,
+             cutout_leaves: true,
++            xray: false,
++            xray_mask: horizon_client::mesher::XRAY_ALL,
++            xray_states: std::sync::Arc::new(Vec::new()),
+             assets: &context.assets,
+             render: &context.render,
+             tables: &context.tables,
+diff --git a/crates/horizon-mods/src/runtime.rs b/crates/horizon-mods/src/runtime.rs
+index cff4472..59e6cac 100644
+--- a/crates/horizon-mods/src/runtime.rs
++++ b/crates/horizon-mods/src/runtime.rs
+@@ -420,6 +420,10 @@ struct State {
+     browser: BrowserState,
+     /// Capability `storage`'s folder; made on first `set`.
+     data_dir: PathBuf,
++    /// Private, process-local channels for the bundled Impact Native UI only.
++    native_impact: std::collections::BTreeMap<String, Vec<u8>>,
++    /// Set only by the native game's host for its explicitly selected sibling UI.
++    native_impact_trusted: bool,
+     /// Bytes `storage::set` may still write before this hook call ends
+     /// (reset per call in [`Mods::call`]): fuel bounds a mod's CPU time but
+     /// not disk I/O time, so a loop of small-fuel, large-payload `set`s
+@@ -622,6 +626,8 @@ impl Mods {
+             input: InputState::default(),
+             browser: BrowserState::default(),
+             data_dir,
++            native_impact: Default::default(),
++            native_impact_trusted: false,
+             storage_budget: STORAGE_WRITE_BUDGET,
+             limits: StoreLimitsBuilder::new()
+                 .memory_size(MEMORY)
+@@ -700,6 +706,81 @@ impl Mods {
+     pub fn entries(&self) -> &[Entry] {
+         &self.entries
+     }
++    /// Trust a particular already-running UI package, selected by the game
++    /// host. Callers must authenticate its path; a manifest id alone is not
++    /// authority and must never extend another sandboxed mod's privileges.
++    pub fn impact_native_trust(&mut self, path: &Path) -> bool {
++        if let Some(r) = self
++            .entries
++            .iter_mut()
++            .filter(|e| e.path == path)
++            .filter_map(|e| e.run.as_mut())
++            .find(|r| r.store.data().id == "impact_horizon_native")
++        {
++            r.store.data_mut().native_impact_trusted = true;
++            true
++        } else {
++            false
++        }
++    }
++
++    /// Whether the bundled Impact Native interface is running in this process.
++    pub fn impact_native_running(&self) -> bool {
++        self.entries.iter().any(|e| {
++            e.run
++                .as_ref()
++                .is_some_and(|r| r.store.data().native_impact_trusted)
++        })
++    }
++
++    /// Identify the exact authenticated owner for the dedicated menu layout.
++    pub fn impact_native_owner(&self, i: usize) -> bool {
++        self.entries
++            .get(i)
++            .and_then(|e| e.run.as_ref())
++            .is_some_and(|r| r.store.data().native_impact_trusted)
++    }
++
++    /// Read one bounded request written by that interface. It is never a file
++    /// or a network endpoint and cannot be read from another mod's store.
++    pub fn impact_native_request(&self, key: &str) -> Option<Vec<u8>> {
++        if !matches!(key, "bridge_request" | "native_request" | "native_visual") {
++            return None;
++        }
++        self.entries
++            .iter()
++            .filter_map(|e| e.run.as_ref())
++            .find(|r| r.store.data().native_impact_trusted)?
++            .store
++            .data()
++            .native_impact
++            .get(key)
++            .cloned()
++    }
++
++    /// Give the bundled interface a fresh in-memory status snapshot. It has
++    /// no authority to write these host-owned keys through `storage::set`.
++    pub fn impact_native_publish(&mut self, key: &str, value: Vec<u8>) -> bool {
++        if !matches!(key, "bridge_status" | "bridge_radar" | "native_status") || value.len() > 4096
++        {
++            return false;
++        }
++        if let Some(r) = self
++            .entries
++            .iter_mut()
++            .filter_map(|e| e.run.as_mut())
++            .find(|r| r.store.data().native_impact_trusted)
++        {
++            r.store
++                .data_mut()
++                .native_impact
++                .insert(key.to_owned(), value);
++            true
++        } else {
++            false
++        }
++    }
++
+     /// What mods read until the next snapshot.
+     pub fn set_snapshot(&mut self, snapshot: Snapshot) {
+         self.snapshot = Arc::new(snapshot);
+@@ -1358,7 +1439,7 @@ fn clip_to(text: String, chars: usize) -> String {
+ }
+ 
+ /// Widgets on a `ui` screen or settings page, and rows on one `list`.
+-const WIDGETS: usize = 64;
++const WIDGETS: usize = 96;
+ const LIST_ROWS: usize = 512;
+ 
+ fn clip_widgets(widgets: Vec<UiWidget>) -> Vec<UiWidget> {
+@@ -1640,7 +1721,7 @@ struct InputState {
+ /// Events kept for `poll`, items claimed and keys, per mod.
+ const INPUT_EVENTS: usize = 256;
+ const CLAIMS: usize = 64;
+-const KEYS: usize = 16;
++const KEYS: usize = 24;
+ 
+ /// `key.keyboard.<name>` or `key.mouse.<name>`, as options.txt writes keys;
+ /// the game knows which names exist and ignores a key it has none for.
+@@ -1915,11 +1996,25 @@ impl ui::Host for State {
+ }
+ impl storage::Host for State {
+     fn get(&mut self, key: String) -> Option<Vec<u8>> {
++        if self.native_impact_trusted && impact_native_key(&key) {
++            return self.native_impact.get(&key).cloned();
++        }
+         storage_key_ok(&key)
+             .then(|| std::fs::read(self.data_dir.join(&key)).ok())
+             .flatten()
+     }
+     fn set(&mut self, key: String, value: Vec<u8>) -> Result<(), String> {
++        if self.native_impact_trusted && impact_native_key(&key) {
++            if !matches!(
++                key.as_str(),
++                "bridge_request" | "native_request" | "native_visual"
++            ) || value.len() > 1024
++            {
++                return Err("reserved native status or oversized request".into());
++            }
++            self.native_impact.insert(key, value);
++            return Ok(());
++        }
+         if !storage_key_ok(&key) {
+             return Err(format!("{key:?} is not [a-z0-9_.-]{{1,64}}"));
+         }
+@@ -1954,12 +2049,34 @@ impl storage::Host for State {
+         Ok(())
+     }
+     fn delete(&mut self, key: String) {
++        if self.native_impact_trusted && impact_native_key(&key) {
++            if matches!(
++                key.as_str(),
++                "bridge_request" | "native_request" | "native_visual"
++            ) {
++                self.native_impact.remove(&key);
++            }
++            return;
++        }
+         if storage_key_ok(&key) {
+             let _ = std::fs::remove_file(self.data_dir.join(&key));
+         }
+     }
+ }
+ 
++/// The only volatile keys belonging to the bundled Native interface.
++fn impact_native_key(key: &str) -> bool {
++    matches!(
++        key,
++        "bridge_status"
++            | "bridge_radar"
++            | "bridge_request"
++            | "native_request"
++            | "native_status"
++            | "native_visual"
++    )
++}
++
+ /// A storage key: one path segment of `[a-z0-9_.-]{1,64}`, not `.` or `..`.
+ /// No `/`, so a key can never leave the mod's own directory.
+ fn storage_key_ok(key: &str) -> bool {
